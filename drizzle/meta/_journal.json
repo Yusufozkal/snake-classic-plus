@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1788950549617,
+      "tag": "0000_tired_stingray",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1789026779228,
+      "tag": "0001_spotty_zeigeist",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1789119963102,
+      "tag": "0002_next_chronomancer",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790865573874,
+      "tag": "0003_wild_bucky",
+      "breakpoints": true
+    }
+  ]
+}
