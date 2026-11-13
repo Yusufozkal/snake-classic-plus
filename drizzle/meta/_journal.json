@@ -29,6 +29,13 @@
       "when": 1790865573874,
       "tag": "0003_wild_bucky",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794581408725,
+      "tag": "0004_leaderboard_revision",
+      "breakpoints": true
     }
   ]
 }

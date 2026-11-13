@@ -6,17 +6,17 @@ const difficulties = new Set(['easy','medium','hard']);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const baseHeaders = {'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'same-origin'};
 function json(body, status=200, headers={}) {return new Response(JSON.stringify(body),{status,headers:{...baseHeaders,'Content-Type':'application/json; charset=utf-8',...headers}});}
-function contentPolicy(nonce){return ["default-src 'none'",nonce?`script-src 'nonce-${nonce}'`:"script-src 'none'","script-src-attr 'none'","style-src 'self' 'unsafe-inline'",nonce?`style-src-elem 'nonce-${nonce}'`:"style-src-elem 'none'","style-src-attr 'unsafe-inline'","img-src 'self' data:","connect-src 'self'","font-src 'self'","media-src 'self'","object-src 'none'","base-uri 'none'","form-action 'self'","frame-ancestors 'self' https://chatgpt.com https://chat.openai.com","upgrade-insecure-requests"].join('; ');}
-function html(body,status=200) {
+function contentPolicy(nonce,embeddable=true){return ["default-src 'none'",nonce?`script-src 'nonce-${nonce}'`:"script-src 'none'","script-src-attr 'none'","style-src 'self' 'unsafe-inline'",nonce?`style-src-elem 'nonce-${nonce}'`:"style-src-elem 'none'","style-src-attr 'unsafe-inline'","img-src 'self' data:","connect-src 'self'","font-src 'self'","media-src 'self'","object-src 'none'","base-uri 'none'","form-action 'self'",embeddable?"frame-ancestors 'self' https://chatgpt.com https://chat.openai.com":"frame-ancestors 'self'","upgrade-insecure-requests"].join('; ');}
+function html(body,status=200,embeddable=true) {
   const nonce=crypto.randomUUID().replaceAll('-','');
   const markup=body.replace(/<(script|style)(?=[\s>])/gi,`<$1 nonce="${nonce}"`);
-  return new Response(markup,{status,headers:{...baseHeaders,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':contentPolicy(nonce)}});
+  return new Response(markup,{status,headers:{...baseHeaders,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':contentPolicy(nonce,embeddable)}});
 }
 function secureResponse(response,request){
   const headers=new Headers(response.headers);
   for(const name of ['Server','X-Powered-By','X-AspNet-Version','X-AspNetMvc-Version','X-Generator'])headers.delete(name);
   if(!headers.has('Content-Security-Policy'))headers.set('Content-Security-Policy',contentPolicy());
-  if(new URL(request.url).protocol==='https:')headers.set('Strict-Transport-Security','max-age=31536000');
+  if(new URL(request.url).protocol==='https:')headers.set('Strict-Transport-Security','max-age=31536000; includeSubDomains');
   headers.set('X-Content-Type-Options','nosniff');headers.set('Referrer-Policy','same-origin');
   headers.set('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=()');
   return new Response(request.method==='HEAD'?null:response.body,{status:response.status,statusText:response.statusText,headers});
@@ -38,19 +38,43 @@ function bad(message,status=400){return json({error:message},status);}
 const preferenceKeys=/^snake_(nickname|difficulty|map|skin|cosmetic|sound_enabled|countdown_enabled|touch_sensitivity|reduce_motion|tutorial_choice_v1)$/;
 function guestIdentity(request){const cookie=request.headers.get('cookie')?.match(/(?:^|;\s*)snake_player=([^;]+)/)?.[1];return uuid.test(cookie||'')?cookie:null;}
 function dayString(time=Date.now()){return new Date(time).toISOString().slice(0,10);}
-async function networkRateKey(request,db,account){
-  // Cloudflare supplies this header; never trust X-Forwarded-For or the player cookie.
-  let ip=request.headers.get('cf-connecting-ip')||'';
+async function networkRateKey(request,env,db,account){
+  // Opt in only to a single-IP header overwritten by the deployment's trusted proxy.
+  const header=env.TRUSTED_IP_HEADER;
+  let ip=['cf-connecting-ip','true-client-ip','x-real-ip'].includes(header)?request.headers.get(header)||'':'';
   if(ip.includes(':')){try{const normalized=new URL('http://['+ip+']/').hostname.replace(/[\[\]]/g,''),halves=normalized.split('::'),left=halves[0]?halves[0].split(':'):[],right=halves[1]?halves[1].split(':'):[];const parts=halves.length===2?[...left,...Array(8-left.length-right.length).fill('0'),...right]:left;if(parts.length!==8)throw Error();ip=parts.slice(0,4).map(p=>p.padStart(4,'0')).join(':');}catch{ip='';}}
   else if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)||ip.split('.').some(p=>Number(p)>255))ip='';
+  else ip=ip.split('.').map(Number).join('.');
   const source=ip||account||'guest-network-unavailable';
-  await db.prepare("INSERT OR IGNORE INTO security_state (key,value) VALUES ('rate_secret',?)").bind(crypto.randomUUID()+crypto.randomUUID()).run();
-  const salt=await db.prepare("SELECT value FROM security_state WHERE key='rate_secret'").first();
-  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(salt.value),{name:'HMAC',hash:'SHA-256'},false,['sign']);
-  return [...new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(source)))].map(b=>b.toString(16).padStart(2,'0')).join('');
+  return {key:await keyedHash(await signingKey(db,'rate_secret'),source),shared:!ip&&!account};
+}
+// Server-side secrets are created once and stay in the database; they are never sent to clients.
+const secretNames=new Set(['rate_secret','player_code_secret']);
+async function signingKey(db,name){
+  if(!secretNames.has(name))throw new Error('Unknown secret');
+  await db.prepare("INSERT OR IGNORE INTO security_state (key,value) VALUES (?,?)").bind(name,crypto.randomUUID()+crypto.randomUUID()).run();
+  const secret=await db.prepare("SELECT value FROM security_state WHERE key=?").bind(name).first();
+  return crypto.subtle.importKey('raw',new TextEncoder().encode(secret.value),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+}
+async function keyedHash(key,value){
+  return [...new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(value)))].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+// Keyed, so a known account or guest identifier cannot be matched to a public code offline.
+async function playerCode(key,playerId){return (await keyedHash(key,playerId)).slice(0,16).toUpperCase();}
+// Invisible, direction-changing and control characters allow look-alike names.
+function cleanNickname(value){return typeof value==='string'?value.normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim():'';}
+const LEADERBOARD_TTL=30000,STALE_RUN_AGE=7*86400000,CLEANUP_INTERVAL=3600000;
+const databaseStates=new WeakMap();
+function databaseState(db){let state=databaseStates.get(db);if(!state){state={cache:null,pending:null,lastCleanup:0};databaseStates.set(db,state);}return state;}
+function configuredLimit(value,fallback){const n=Number(value);return Number.isSafeInteger(n)&&n>=1&&n<=100000?n:fallback;}
+// Abandoned runs can no longer be finished after three hours; drop them after a week.
+async function removeStaleRuns(db,now){
+  const state=databaseState(db);if(now-state.lastCleanup<CLEANUP_INTERVAL)return;state.lastCleanup=now;
+  try{await db.prepare('DELETE FROM game_runs WHERE finished_at IS NULL AND started_at<?').bind(now-STALE_RUN_AGE).run();}catch(error){console.error('Stale run cleanup failed',error?.message);}
 }
 function questsForDay(date){const pool=[...QUEST_POOL],random=seededRandom(Number(date.replaceAll('-','')));for(let i=pool.length-1;i>0;i--){const j=Math.floor(random()*(i+1));[pool[i],pool[j]]=[pool[j],pool[i]];}return pool.slice(0,3);}
 async function readProgress(env,player){
+  if(!player)return emptyProgress();
   const db=database(env),qsum=new Set(['q_apples','q_powerups','q_confuse_eat','q_shield_blocks']);
   const aggregate=await db.prepare(`SELECT COALESCE(SUM(CASE WHEN outcome='completed' THEN score ELSE 0 END),0) AS xp, COALESCE(SUM(json_extract(rewards,'$.magnets')),0) AS magnets, COALESCE(SUM(json_extract(rewards,'$.shields')),0) AS shields, ${ACHIEVEMENTS.map(a=>`COALESCE(MAX(json_extract(rewards,'$.achievements.${a.id}')),0) AS ${a.id}`).join(',')} FROM game_runs WHERE player_id=? AND verified=1`).bind(player||'').first();
   const modes=await db.prepare('SELECT map,difficulty,MAX(score) AS score FROM game_runs WHERE player_id=? AND verified=1 GROUP BY map,difficulty').bind(player||'').all();
@@ -63,20 +87,38 @@ async function readProgress(env,player){
   for(const map of maps)for(const diff of difficulties)data[`snake_hs_${diff}_${map}`]=String(modes.results.find(r=>r.map===map&&r.difficulty===diff)?.score||0);
   return data;
 }
+// A visitor without a player identity has no stored runs; skip the database.
+function emptyProgress(){
+  const today=dayString(),data={snake_player_xp:'0',snake_achievements:'{}',snake_stats:JSON.stringify({playedMaps:[],magnetsUsed:0,shieldBlocks:0}),snake_quest_date:today,snake_daily_quests:JSON.stringify(questsForDay(today).map(q=>({id:q.id,progress:0,completed:false})))};
+  for(const map of maps)for(const diff of difficulties)data[`snake_hs_${diff}_${map}`]='0';
+  return data;
+}
 async function start(request,env) {
   const input=await body(request);
   if(Object.hasOwn(input,'accountKey')&&input.accountKey!==await accountId(request))return bad('Açık hesap değişti. Sayfayı yenile.',409);
-  const nickname=typeof input.nickname==='string'?input.nickname.trim():'';
-  if(input.skin!==undefined&&!['blue','green','red','purple','gold','rainbow'].includes(input.skin)||input.cosmetic!==undefined&&!['none','crown','sunglasses','tophat','cap','bow'].includes(input.cosmetic))return bad('Görünüm seçimi geçersiz.');
-  if(!nickname||nickname.length>15||/[\u0000-\u001f\u007f]/.test(nickname)||!maps.has(input.map)||!difficulties.has(input.difficulty)||!uuid.test(input.id||'')||!uuid.test(input.token||''))return bad('Oyuncu adı veya oyun ayarları geçersiz.');
+  const nickname=cleanNickname(input.nickname);
+  if(!maps.has(input.map)||!difficulties.has(input.difficulty)||!uuid.test(input.id||'')||!uuid.test(input.token||''))return bad('Oyuncu adı veya oyun ayarları geçersiz.');
   const db=database(env),now=Date.now(),tokenHash=await hash(input.token);
+  await removeStaleRuns(db,now);
   const account=await accountId(request),guestId=guestIdentity(request)||crypto.randomUUID(),playerId=account||guestId;
   const responseFor=run=>json({id:input.id,seed:run.seed,rulesVersion:run.rules_version,maxTicks:MAX_REPLAY_TICKS},201,{'Set-Cookie':`snake_player=${run.player_id.startsWith('account:')?guestId:run.player_id}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=31536000`});
   const existing=await db.prepare('SELECT * FROM game_runs WHERE id=?').bind(input.id).first();
   if(existing){if(existing.token_hash!==tokenHash||existing.map!==input.map||existing.difficulty!==input.difficulty||(existing.player_id.startsWith('account:')?existing.player_id!==account:!!account))return bad('Oyun kimliği kullanımda.',409);if(![1,2,RULES_VERSION].includes(existing.rules_version))return bad('Eski oyun kaydı. Yeni bir oyun başlat.',409);return responseFor(existing);}
+  // Existing token-bound runs remain retryable even if newer name rules reject their name.
+  if(!nickname||nickname.length>15)return bad('Oyuncu adı veya oyun ayarları geçersiz.');
+  if(input.skin!==undefined&&!['blue','green','red','purple','gold','rainbow'].includes(input.skin)||input.cosmetic!==undefined&&!['none','crown','sunglasses','tophat','cap','bow'].includes(input.cosmetic))return bad('Görünüm seçimi geçersiz.');
   if(input.rulesVersion!==RULES_VERSION)return bad('Oyun güncellendi. Sayfayı yenileyip yeni bir oyun başlat.',409);
-  const rateKey=await networkRateKey(request,db,account),seed=crypto.getRandomValues(new Uint32Array(1))[0],cosmetic=input.skin&&input.skin!=='blue'||input.cosmetic&&input.cosmetic!=='none'?'styled':'plain';
-  const result=await db.prepare('INSERT OR IGNORE INTO game_runs (id,player_id,token_hash,nickname,map,difficulty,started_at,seed,rules_version,rate_key,cosmetic,quest_date) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<12 AND (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<12 AND (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<300').bind(input.id,playerId,tokenHash,nickname,input.map,input.difficulty,now,seed,RULES_VERSION,rateKey,cosmetic,dayString(now),rateKey,now-60000,playerId,now-60000,rateKey,now-86400000).run();
+  const network=await networkRateKey(request,env,db,account),seed=crypto.getRandomValues(new Uint32Array(1))[0],cosmetic=input.skin&&input.skin!=='blue'||input.cosmetic&&input.cosmetic!=='none'?'styled':'plain';
+  const siteMinute=configuredLimit(env.SITE_RUNS_PER_MINUTE,120),siteDay=configuredLimit(env.SITE_RUNS_PER_DAY,10000);
+  // All quotas are checked inside the insert, so concurrent requests cannot overbook.
+  await db.prepare(`INSERT OR IGNORE INTO game_runs (id,player_id,token_hash,nickname,map,difficulty,started_at,seed,rules_version,rate_key,cosmetic,quest_date)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE
+    (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<? AND
+    (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<12 AND
+    (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<300 AND
+    (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<? AND
+    (SELECT COUNT(*) FROM game_runs WHERE started_at>?)<? AND
+    (SELECT COUNT(*) FROM game_runs WHERE started_at>?)<?`).bind(input.id,playerId,tokenHash,nickname,input.map,input.difficulty,now,seed,RULES_VERSION,network.key,cosmetic,dayString(now),network.key,now-60000,network.shared?120:12,playerId,now-60000,playerId,now-86400000,network.key,now-86400000,network.shared?siteDay:300,now-60000,siteMinute,now-86400000,siteDay).run();
   const stored=await db.prepare('SELECT * FROM game_runs WHERE id=?').bind(input.id).first();
   if(!stored)return bad('Yeni oyun sınırına ulaşıldı. Biraz sonra tekrar dene veya antrenman modunu kullan.',429);
   if(stored.token_hash!==tokenHash)return bad('Oyun kimliği kullanımda.',409);
@@ -92,10 +134,15 @@ async function finish(request,env,id) {
   if(run.finished_at!==null){if(!run.verified||run.proof_hash!==proofHash)return bad('Bu oyun zaten kaydedildi.',409);return json({saved:true,score:run.score,progress:await readProgress(env,run.player_id)});}
   const attempt=await db.prepare('UPDATE game_runs SET proof_attempts=proof_attempts+1 WHERE id=? AND proof_attempts<5 AND finished_at IS NULL').bind(id).run();
   if(!Number(attempt.meta?.changes??attempt.changes))return bad('Bu oyunun doğrulama sınırına ulaşıldı. Yeni bir oyun başlat.',429);
-  const now=Date.now();let replay;try{replay=(run.rules_version===1?replayV1.verifyReplay:run.rules_version===2?replayV2.verifyReplay:verifyReplay)(run,input,now);}catch(error){return bad(error.message);}
+  const now=Date.now();let replay;try{replay=(run.rules_version===1?replayV1.verifyReplay:run.rules_version===2?replayV2.verifyReplay:verifyReplay)(run,input,now);}catch(error){
+    // Only the verifier's own plain Error messages are meant for players.
+    if(error?.constructor===Error)return bad(error.message);
+    console.error('Replay verification failed unexpectedly',error?.message);return bad('Hamle kaydı doğrulanamadı.');
+  }
   const rewards={...replay.rewards,achievements:Object.fromEntries(replay.rewards.achievements.map(k=>[k,1]))};if(run.cosmetic==='styled')rewards.achievements.fashion_icon=1;
   await db.prepare('UPDATE game_runs SET finished_at=?,score=?,duration_seconds=?,outcome=?,verified=1,proof_hash=?,rewards=? WHERE id=? AND finished_at IS NULL').bind(now,replay.score,Math.floor(replay.elapsed/1000),input.outcome,proofHash,JSON.stringify(rewards),id).run();
   const saved=await db.prepare('SELECT proof_hash,score FROM game_runs WHERE id=?').bind(id).first();if(saved.proof_hash!==proofHash)return bad('Bu oyun zaten kaydedildi.',409);
+  databaseState(db).cache=null;
   return json({saved:true,score:saved.score,progress:await readProgress(env,run.player_id)});
 }
 async function admin(request,env,url){
@@ -114,7 +161,8 @@ async function admin(request,env,url){
     db.prepare('SELECT COUNT(*) AS count FROM game_runs'+clause).bind(...values).first(),
     db.prepare('SELECT id, player_id, nickname, map, difficulty, started_at, finished_at, score, duration_seconds, outcome, verified FROM game_runs'+clause+' ORDER BY started_at DESC, id DESC LIMIT 50 OFFSET ?').bind(...values,(page-1)*50).all(),
   ]);
-  const runs=await Promise.all(rows.results.map(async ({player_id,...run})=>({...run,player_code:(await hash('snake-player-code:'+player_id)).slice(0,16).toUpperCase()})));
+  const codeKey=rows.results.length?await signingKey(db,'player_code_secret'):null;
+  const runs=await Promise.all(rows.results.map(async ({player_id,...run})=>({...run,player_code:await playerCode(codeKey,player_id)})));
   return json({summary,total:count.count,page,pageSize:50,runs});
 }
 async function accountId(request){
@@ -142,16 +190,30 @@ async function saveProfile(request,env){
   return json({revision:input.revision+1});
 }
 async function leaderboard(env){
-  const rows=await database(env).prepare('SELECT player_id, nickname, score, map, difficulty, finished_at FROM (SELECT id, player_id, nickname, score, map, difficulty, finished_at, ROW_NUMBER() OVER (PARTITION BY player_id, map, difficulty ORDER BY score DESC, finished_at ASC, id ASC) AS position FROM game_runs WHERE verified=1 AND finished_at IS NOT NULL AND score > 0) WHERE position = 1 ORDER BY score DESC, finished_at ASC, id ASC LIMIT 20').all();
-  const scores=await Promise.all(rows.results.map(async r=>({name:r.nickname,score:r.score,map:r.map,diff:r.difficulty,date:new Date(r.finished_at).toLocaleDateString('tr-TR'),playerCode:(await hash('snake-player-code:'+r.player_id)).slice(0,16).toUpperCase()})));
-  return json({scores});
+  const db=database(env),state=databaseState(db),now=Date.now();
+  // Database triggers invalidate caches in every Worker instance, including in-flight reads.
+  const revision=(await db.prepare("SELECT value FROM security_state WHERE key='leaderboard_revision'").first())?.value??'0';
+  if(revision!==undefined&&state.cache?.revision===revision&&now>=state.cache.time&&now-state.cache.time<LEADERBOARD_TTL)return json({scores:state.cache.scores});
+  if(revision!==undefined&&state.pending?.revision===revision)return json({scores:await state.pending.promise});
+  const pending={revision};
+  pending.promise=(async()=>{
+    const rows=await db.prepare('SELECT player_id, nickname, score, map, difficulty, finished_at FROM (SELECT id, player_id, nickname, score, map, difficulty, finished_at, ROW_NUMBER() OVER (PARTITION BY player_id, map, difficulty ORDER BY score DESC, finished_at ASC, id ASC) AS position FROM game_runs WHERE verified=1 AND finished_at IS NOT NULL AND score > 0) WHERE position = 1 ORDER BY score DESC, finished_at ASC, id ASC LIMIT 20').all();
+    const codeKey=rows.results.length?await signingKey(db,'player_code_secret'):null;
+    const scores=await Promise.all(rows.results.map(async r=>({name:r.nickname,score:r.score,map:r.map,diff:r.difficulty,date:new Date(r.finished_at).toLocaleDateString('tr-TR'),playerCode:await playerCode(codeKey,r.player_id)})));
+    const after=(await db.prepare("SELECT value FROM security_state WHERE key='leaderboard_revision'").first())?.value??'0';
+    if(revision!==undefined&&after===revision)state.cache={time:now,revision,scores};
+    return scores;
+  })();
+  state.pending=pending;
+  try{return json({scores:await pending.promise});}finally{if(state.pending===pending)state.pending=null;}
 }
 async function deleteRuns(request,env){
   if(!owner(request,env))return bad('Bu işlem yalnızca site sahibine açıktır.',request.headers.get('oai-authenticated-user-id')?403:401);
   const input=await body(request);
   if(!Array.isArray(input.ids)||input.ids.length<1||input.ids.length>50||input.ids.some(id=>typeof id!=='string'||!uuid.test(id)))return bad('1 ile 50 arasında geçerli kayıt seçmelisin.');
   const ids=[...new Set(input.ids)];
-  const result=await database(env).prepare('DELETE FROM game_runs WHERE id IN ('+ids.map(()=>'?').join(',')+')').bind(...ids).run();
+  const db=database(env),result=await db.prepare('DELETE FROM game_runs WHERE id IN ('+ids.map(()=>'?').join(',')+')').bind(...ids).run();
+  databaseState(db).cache=null;
   return json({deleted:Number(result.meta?.changes??result.changes??0)});
 }
 async function securityReport(request,env){
@@ -175,7 +237,7 @@ const app = {
    if(request.method==='POST'&&url.pathname==='/api/security-reports')return await securityReport(request,env);
    if(['/admin/security','/api/admin/security-reports'].includes(url.pathname)&&request.method==='GET'){
     if(!owner(request,env))return bad('Bu ekran yalnızca site sahibine açıktır.',request.headers.get('oai-authenticated-user-id')?403:401);
-    if(url.pathname==='/admin/security')return html(securityAdminHTML);
+    if(url.pathname==='/admin/security')return html(securityAdminHTML,200,false);
     const rows=await database(env).prepare('SELECT id,contact,details,created_at FROM security_reports ORDER BY created_at DESC, id DESC LIMIT 50').all();
     return json({reports:rows.results});
    }
@@ -190,7 +252,7 @@ const app = {
    if(request.method==='GET'&&url.pathname==='/admin'){
     if(!request.headers.get('oai-authenticated-user-id'))return html('<!doctype html><html lang="tr"><meta name="viewport" content="width=device-width"><title>Yönetici girişi</title><body style="background:#090d16;color:#f8fafc;font:18px system-ui;padding:48px"><h1>Oyun kayıtları</h1><p>Bu sayfayı yalnızca site sahibi görüntüleyebilir.</p><a style="color:#38bdf8" target="_top" href="/signin-with-chatgpt?return_to=%2Fadmin">ChatGPT ile giriş yap</a></body></html>');
     if(!owner(request,env))return html('<!doctype html><html lang="tr"><title>Erişim yok</title><p>Bu ekran yalnızca site sahibine açıktır.</p><a href="/">Oyuna dön</a></html>',403);
-    return html(adminHTML);
+    return html(adminHTML,200,false);
    }
    if(request.method==='GET'&&url.pathname==='/api/admin/runs')return await admin(request,env,url);
    if(request.method==='GET'&&url.pathname==='/api/leaderboard')return await leaderboard(env);
@@ -207,6 +269,12 @@ const app = {
  }
 };
 export default {async fetch(request,env){
+  // Raw HTTP callers and copies of this Worker have no platform identity by default.
+  if(env.TRUST_PLATFORM_IDENTITY!=='1'){
+    const headers=new Headers(request.headers);
+    for(const key of [...headers.keys()])if(key.startsWith('oai-authenticated-'))headers.delete(key);
+    request=new Request(request,{headers});
+  }
   const url=new URL(request.url);
   if(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)){
     url.protocol='https:';return secureResponse(new Response(null,{status:308,headers:{Location:url.href}}),request);

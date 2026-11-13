@@ -4,9 +4,14 @@ const root=path.resolve(__dirname,'..'),worker=(await import(pathToFileURL(root+
 const {createReplayEngine:createV1ReplayEngine,RULES_VERSION:V1_RULES_VERSION}=await import(pathToFileURL(root+'/dist/server/replay-v1.js'));
 const {createReplayEngine:createV2ReplayEngine,RULES_VERSION:V2_RULES_VERSION}=await import(pathToFileURL(root+'/dist/server/replay-v2.js'));
 const db=new DatabaseSync(':memory:');for(const f of fs.readdirSync(root+'/drizzle').filter(f=>f.endsWith('.sql')).sort())db.exec(fs.readFileSync(root+'/drizzle/'+f,'utf8'));
-const upgrade=new DatabaseSync(':memory:'),migrations=fs.readdirSync(root+'/drizzle').filter(f=>f.endsWith('.sql')).sort();for(const f of migrations.slice(0,-1))upgrade.exec(fs.readFileSync(root+'/drizzle/'+f,'utf8'));
-upgrade.prepare('INSERT INTO game_runs(id,player_id,token_hash,nickname,map,difficulty,started_at,finished_at,score) VALUES(?,?,?,?,?,?,?,?,?)').run('existing','legacy','old-token','Old Player','classic','hard',1,2,12345);upgrade.prepare('INSERT INTO player_profiles(account_id,data,revision) VALUES(?,?,1)').run('legacy-profile','{"snake_player_xp":"500","snake_nickname":"Old Player"}');upgrade.exec(fs.readFileSync(root+'/drizzle/'+migrations.at(-1),'utf8'));assert.equal(upgrade.prepare('SELECT score,verified FROM game_runs').get().score,12345);assert.equal(upgrade.prepare('SELECT verified FROM game_runs').get().verified,0);assert.equal(JSON.parse(upgrade.prepare('SELECT data FROM player_profiles').get().data).snake_player_xp,'500');upgrade.close();
-const env={DB:{prepare(sql){const s=db.prepare(sql);let v=[];return{bind(...args){v=args;return this},async first(){return s.get(...v)||null},async all(){return{results:s.all(...v)}},async run(){return s.run(...v)}}}},ADMIN_EMAIL:'owner@example.test'};
+const upgrade=new DatabaseSync(':memory:'),migrations=fs.readdirSync(root+'/drizzle').filter(f=>f.endsWith('.sql')).sort(),verificationMigration=migrations.indexOf('0003_wild_bucky.sql');
+assert(verificationMigration>0,'the upgrade fixture must begin before replay verification was added');
+for(const f of migrations.slice(0,verificationMigration))upgrade.exec(fs.readFileSync(root+'/drizzle/'+f,'utf8'));
+assert(!upgrade.prepare('PRAGMA table_info(game_runs)').all().some(column=>column.name==='verified'));
+upgrade.prepare('INSERT INTO game_runs(id,player_id,token_hash,nickname,map,difficulty,started_at,finished_at,score) VALUES(?,?,?,?,?,?,?,?,?)').run('existing','legacy','old-token','Old Player','classic','hard',1,2,12345);upgrade.prepare('INSERT INTO player_profiles(account_id,data,revision) VALUES(?,?,1)').run('legacy-profile','{"snake_player_xp":"500","snake_nickname":"Old Player"}');
+for(const f of migrations.slice(verificationMigration))upgrade.exec(fs.readFileSync(root+'/drizzle/'+f,'utf8'));
+assert.equal(upgrade.prepare('SELECT score,verified FROM game_runs').get().score,12345);assert.equal(upgrade.prepare('SELECT verified FROM game_runs').get().verified,0);assert.equal(JSON.parse(upgrade.prepare('SELECT data FROM player_profiles').get().data).snake_player_xp,'500');upgrade.close();
+const env={DB:{prepare(sql){const s=db.prepare(sql);let v=[];return{bind(...args){v=args;return this},async first(){return s.get(...v)||null},async all(){return{results:s.all(...v)}},async run(){return s.run(...v)}}}},ADMIN_EMAIL:'owner@example.test',TRUST_PLATFORM_IDENTITY:'1',TRUSTED_IP_HEADER:'cf-connecting-ip'};
 const realNow=Date.now;let time=realNow();Date.now=()=>time;
 const account=id=>'account:'+createHash('sha256').update(id).digest('hex');
 async function api(route,data,options={}){const headers={origin:'https://game.example','content-type':'application/json',...(options.ip?{'cf-connecting-ip':options.ip}:{}),...(options.cookie?{cookie:'snake_player='+options.cookie}:{}),...(options.id?{'oai-authenticated-user-id':options.id}:{}),...options.headers};const r=await worker.fetch(new Request('https://game.example'+route,{method:data===undefined?'GET':'POST',headers,body:data===undefined?undefined:JSON.stringify({...data,...(options.id?{accountKey:account(options.id)}:{})})}),env);const type=r.headers.get('content-type');return{status:r.status,data:type?.includes('json')?await r.json():await r.text(),headers:r.headers};}
@@ -46,7 +51,16 @@ const finish={token:run.token,score:valid.score,ticks:10,moves:[],outcome:'compl
 r=await api('/api/runs/'+run.id+'/finish',{...finish,ticks:11},{cookie:run.cookie});assert.equal(r.status,409);
 const results=await Promise.all(Array.from({length:25},(_,i)=>start({ip:'203.0.113.2',cookie:i%2?randomUUID():undefined})));assert.equal(results.filter(r=>r.status===201).length,12);assert.equal(results.filter(r=>r.status===429).length,13);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM game_runs WHERE rate_key=(SELECT rate_key FROM game_runs WHERE id=?)').get(results.find(r=>r.status===201).id).n,12);
 for(let i=0;i<12;i++)assert.equal((await start({ip:'2001:db8::'+(i+1).toString(16)})).status,201);assert.equal((await start({ip:'2001:0db8:0000:0000::ffff'})).status,429);
-for(let i=0;i<12;i++)assert.equal((await start()).status,201);assert.equal((await start({headers:{'x-forwarded-for':'198.51.100.199'}})).status,429);
+// With no trusted network identity, independent guests share a generous cap.
+// Start in a fresh window so the site-wide quota cannot mask this boundary.
+time+=61000;
+for(let i=0;i<120;i++)assert.equal((await start()).status,201);
+assert.equal((await start({headers:{'x-forwarded-for':'198.51.100.199'}})).status,429,'a caller-supplied forwarded address must not bypass the missing-IP cap');
+time+=61000;
+const sameGuest=randomUUID();
+for(let i=0;i<12;i++)assert.equal((await start({cookie:sameGuest})).status,201);
+assert.equal((await start({cookie:sameGuest})).status,429,'the individual player quota remains 12 even without a trusted IP');
+time+=61000;
 const id='alpha';db.prepare('INSERT INTO player_profiles(account_id,data,revision) VALUES(?,?,1)').run(account(id),JSON.stringify({snake_nickname:'Saved Name',snake_player_xp:'999999999',snake_achievements:'{"score_300":1}',snake_hs_hard_classic:'1000000'}));
 r=await api('/api/profile',undefined,{id});assert.equal(r.data.data.snake_player_xp,'0');assert.equal(r.data.data.snake_achievements,'{}');assert.equal(r.data.data.snake_hs_hard_classic,'0');assert.equal(r.data.data.snake_nickname,'Saved Name');
 for(const key of ['snake_player_xp','snake_achievements','snake_stats','snake_daily_quests','snake_hs_hard_classic']){r=await api('/api/profile',{revision:1,data:{[key]:'999999'}},{id});assert.equal(r.status,400);}
@@ -103,7 +117,9 @@ const v3Run=insertVersionedRun({player:'v3-mushroom',version:3,seed:v2Fixture.se
 const wrongMushroomProof=await api('/api/runs/'+v3Run.id+'/finish',{...v2Proof,token:v3Run.token,rulesVersion:2},{id:'v3-mushroom'});
 if(v2State.score!==v2Fixture.currentState.score||v2State.dead!==v2Fixture.currentState.dead)assert.equal(wrongMushroomProof.status,400);else{assert.equal(wrongMushroomProof.status,200);assert.deepEqual(JSON.parse(db.prepare('SELECT rewards FROM game_runs WHERE id=?').get(v3Run.id).rewards),storedRewards(v2Fixture.currentState));}
 
-time=Date.parse('2026-10-02T23:59:59Z');for(let i=0;i<12;i++)assert.equal((await start({ip:'203.0.113.9'})).status,201);time+=2000;assert.equal((await start({ip:'203.0.113.9'})).status,429,'midnight must not reset the minute quota');
+// Move forward to a fresh UTC midnight instead of moving the clock behind
+// earlier runs, which would make them count against the new global quota.
+time=(Math.floor(time/86400000)+2)*86400000-1000;for(let i=0;i<12;i++)assert.equal((await start({ip:'203.0.113.9'})).status,201);time+=2000;assert.equal((await start({ip:'203.0.113.9'})).status,429,'midnight must not reset the minute quota');
 for(let i=0;i<300;i++){time+=61000;assert.equal((await start({ip:'203.0.113.10'})).status,201);}time+=61000;assert.equal((await start({ip:'203.0.113.10'})).status,429,'rolling daily cap');
 console.log('PASS: immediate million, speed, forged valid-replay score, legal scoring, idempotency, concurrent/rotated-cookie/IPv6/missing-IP rate caps, protected progression, account ownership, legacy isolation, v1 history/active-run compatibility, stored-version verifier selection, old-tab rejection, admin and origin controls.');
 }finally{Date.now=realNow;db.close();}

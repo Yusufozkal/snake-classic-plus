@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://snake-classic-plus.yusufzkal.chatgpt.site/">
+  <a href="https://snake-classic-plus.turkishvito.chatgpt.site/">
     <img src="docs/assets/hero.svg" alt="Snake Classic+ — Kaydır. Yön değiştir. Rekorunu geç. 6 harita, 3 zorluk, 14 yem ve güç." width="100%">
   </a>
 </p>
@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://snake-classic-plus.yusufzkal.chatgpt.site/"><img src="docs/assets/play.svg" alt="Canlı oyna" width="210" height="48"></a>
+  <a href="https://snake-classic-plus.turkishvito.chatgpt.site/"><img src="docs/assets/play.svg" alt="Canlı oyna" width="210" height="48"></a>
 </p>
 
 <p align="center">
@@ -81,7 +81,7 @@ npm run dev
 
 Tarayıcıda **[localhost:3000](http://localhost:3000/)** adresini aç. Oyunu çalıştırmak için ek paket kurulumu gerekmez; derleme ve yerel sunucu Node.js'in yerleşik araçlarını kullanır.
 
-> **Sadece oynamak mı istiyorsun?** Kurulum yapmadan [canlı oyunu açabilirsin](https://snake-classic-plus.yusufzkal.chatgpt.site/).
+> **Sadece oynamak mı istiyorsun?** Kurulum yapmadan [canlı oyunu açabilirsin](https://snake-classic-plus.turkishvito.chatgpt.site/).
 
 ## Geliştirici notları
 
@@ -137,7 +137,7 @@ Kaynak değiştirildiğinde sunucuyu durdurup yeniden başlat. Otomatik yenileme
 
 Yerel sunucuda misafir olarak oynanır. ChatGPT ile giriş ve yönetici erişimi, canlı sitenin doğrulanmış kimlik entegrasyonuna bağlıdır. Yerel adaptör, istemciden gelen kimlik başlıklarını siler; yalnızca `ADMIN_EMAIL` tanımlamak yönetici erişimi sağlamaz. `.env.example` örnek bir dosyadır; sunucu `.env` dosyasını otomatik yüklemez.
 
-Başka bir sağlayıcıya dağıtırken kimlik doğrulamasını o ortama uyarlamak ve veritabanını bağlamak gerekir. Mevcut Worker, güvenilir platformun kimlik başlıklarını esas alır; bu uçları aynı başlıkları ziyaretçinin belirleyebildiği bir sunucuda doğrudan yayınlamayın.
+Başka bir sağlayıcıya dağıtırken kimlik doğrulamasını o ortama uyarlamak ve veritabanını bağlamak gerekir. Worker, kimlik başlıklarını varsayılan olarak yok sayar; `TRUST_PLATFORM_IDENTITY=1` yalnızca başlıkları güvenilir biçimde doğrulayan platformda açılmalıdır. Güvenilir IP kaynağı da ayrıca yapılandırılır. [Güvenlik ayarları ve kayıt sınırları](SECURITY.md) dağıtım öncesinde kontrol edilmelidir.
 
 Tam oyun bir sunucu ve veritabanı gerektirir; **GitHub Pages tek başına yeterli değildir.** `build-static.cjs` / `serve-static.cjs` tam uygulamanın yerine geçmez.
 
@@ -149,7 +149,7 @@ Bu depodaki `.openai/hosting.json` yalnızca mantıksal veritabanı bağını i�
 
 <p align="center">
   <strong>Küçük bir mola. Bir rekor daha.</strong><br>
-  <a href="https://snake-classic-plus.yusufzkal.chatgpt.site/">Oyna</a> ·
+  <a href="https://snake-classic-plus.turkishvito.chatgpt.site/">Oyna</a> ·
   <a href="https://github.com/Yusufozkal/snake-classic-plus/issues">Hatalar ve fikirler</a> ·
   <a href="#kurulum">Bilgisayarında çalıştır</a>
 </p>
