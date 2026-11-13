@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title description">
+<title id="title">Snake Classic+ — Bir tur daha.</title><desc id="description">Koyu mavi bir oyun tahtası üzerinde yeşil yılan. 6 harita, 3 zorluk ve 14 yem ile güç.</desc>
+<defs>
+ <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#102639"/><stop offset="1" stop-color="#06121e"/></linearGradient>
+ <linearGradient id="body" x2="1" y2="1"><stop stop-color="#6ee7b7"/><stop offset="1" stop-color="#23aa83"/></linearGradient>
+ <radialGradient id="aura"><stop stop-color="#1e8f7b" stop-opacity=".3"/><stop offset="1" stop-color="#0a1928" stop-opacity="0"/></radialGradient>
+ <pattern id="grid" width="38" height="38" patternUnits="userSpaceOnUse"><path d="M38 0H0V38" fill="none" stroke="#294759" stroke-opacity=".55" stroke-width="1"/></pattern>
+ <filter id="shadow" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dy="8" stdDeviation="12" flood-color="#020b12" flood-opacity=".65"/></filter>
+ <filter id="glow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="12"/></filter>
+ <clipPath id="round"><rect width="1200" height="440" rx="28"/></clipPath>
+</defs>
+<g clip-path="url(#round)">
+ <rect width="1200" height="440" fill="url(#bg)"/><ellipse cx="970" cy="180" rx="430" ry="360" fill="url(#aura)"/>
+ <path d="M0 420H1200" stroke="#41657a" stroke-opacity=".25"/>
+ <circle cx="66" cy="63" r="5" fill="#59d7a2"/><text x="84" y="69" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="700" letter-spacing="4" fill="#7ddfc0">BİR TUR DAHA.</text>
+ <text x="58" y="166" font-family="Segoe UI,Arial,sans-serif" font-size="86" font-weight="800" letter-spacing="-3" fill="#f0f9ff">SNAKE</text>
+ <text x="57" y="251" font-family="Segoe UI,Arial,sans-serif" font-size="86" font-weight="800" letter-spacing="-3" fill="#59d7a2">CLASSIC<tspan fill="#e9fff8">+</tspan></text>
+ <text x="62" y="298" font-family="Segoe UI,Arial,sans-serif" font-size="21" fill="#b8cedd">Kaydır. Yön değiştir. Rekorunu geç.</text>
+ <g font-family="Segoe UI,Arial,sans-serif" font-size="14" font-weight="650" text-anchor="middle">
+  <rect x="62" y="334" width="132" height="36" rx="18" fill="#163b43" stroke="#336557"/><text x="128" y="357" fill="#9af2cb">6 HARİTA</text>
+  <rect x="205" y="334" width="132" height="36" rx="18" fill="#173248" stroke="#34536d"/><text x="271" y="357" fill="#b9e6ff">3 ZORLUK</text>
+  <rect x="348" y="334" width="175" height="36" rx="18" fill="#2c2746" stroke="#574774"/><text x="435" y="357" fill="#d8c0ff">14 YEM &amp; GÜÇ</text>
+ </g>
+ <g transform="translate(722 42) rotate(-7 200 174)" filter="url(#shadow)">
+  <rect width="388" height="350" rx="24" fill="#102638" stroke="#3e6376" stroke-width="2"/>
+  <rect x="24" y="24" width="340" height="302" rx="14" fill="#081b2a"/>
+  <rect x="24" y="24" width="340" height="302" rx="14" fill="url(#grid)"/>
+  <path d="M84 257H198Q236 257 236 219V181Q236 143 198 143H122Q84 143 84 105V86" fill="none" stroke="#4ecb9e" stroke-opacity=".35" stroke-width="42" filter="url(#glow)"/>
+  <path d="M84 257H198Q236 257 236 219V181Q236 143 198 143H122Q84 143 84 105V86" fill="none" stroke="url(#body)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M84 257H141" stroke="#97f5ca" stroke-opacity=".23" stroke-width="6" stroke-linecap="round"/>
+  <rect x="65" y="61" width="38" height="45" rx="16" fill="#86f1bb" stroke="#d2ffdf" stroke-width="1.5"/>
+  <circle cx="74" cy="74" r="4" fill="#0b3029"/><circle cx="94" cy="74" r="4" fill="#0b3029"/>
+  <path d="M81 60v-9m6 9v-9" stroke="#f9a8d4" stroke-width="3" stroke-linecap="round"/>
+  <g transform="translate(304 78)"><path d="M0-8C-26-30-36 16-11 28C-5 32-2 27 0 29C2 27 5 32 11 28C36 16 26-30 0-8Z" fill="#fb5e6b"/><path d="M0-10Q0-24 10-28" fill="none" stroke="#9cec9f" stroke-width="5" stroke-linecap="round"/><path d="M-17-1Q-25 7-17 15" fill="none" stroke="#ffb8ba" stroke-width="3" stroke-linecap="round"/></g>
+  <g transform="translate(312 256)"><path d="M0-19 17 0 0 19-17 0Z" fill="#bf8bff" stroke="#e8d0ff" stroke-width="2"/><path d="M-17 0H17M0-19 5 0 0 19" fill="none" stroke="#e8d0ff" stroke-width="1.5"/></g>
+  <circle cx="44" cy="306" r="3" fill="#59d7a2"/><circle cx="56" cy="306" r="3" fill="#59d7a2" opacity=".5"/>
+ </g>
+ <path d="M623 113h16m-8-8v16M677 329h12m-6-6v12" stroke="#7dd3fc" stroke-opacity=".65" stroke-width="2" stroke-linecap="round"/>
+</g><rect x="1" y="1" width="1198" height="438" rx="27" fill="none" stroke="#41667c" stroke-opacity=".6"/>
+</svg>
