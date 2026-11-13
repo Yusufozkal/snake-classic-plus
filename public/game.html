@@ -1538,7 +1538,7 @@
         }
 
         function saveNickname() {
-            const val = nicknameInput.value.trim();
+            const val = nicknameInput.value.normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim().slice(0,15);
             if (val.length > 0) {
                 playerNickname = val;
                 storage.setItem('snake_nickname', playerNickname);

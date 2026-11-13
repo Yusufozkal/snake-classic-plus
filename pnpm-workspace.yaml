@@ -1,9 +1,6 @@
 nodeLinker: hoisted
 ignoredBuiltDependencies:
   - esbuild
-  - sharp
-  - workerd
-allowBuilds:
-  esbuild: set this to true or false
-  sharp: set this to true or false
-  workerd: set this to true or false
+overrides:
+  # oxfmt pins a tinypool release with known prototype-pollution advisories.
+  tinypool: ^2.1.2
