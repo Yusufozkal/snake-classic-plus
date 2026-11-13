@@ -16,7 +16,7 @@ const {pathToFileURL}=require('url');
   try{const chunks=[];for await(const chunk of req)chunks.push(chunk);const headers=new Headers();for(const [key,value]of Object.entries(req.headers))if(value)headers.set(key,String(value));
    // Local HTTP must not accept caller-supplied platform identity headers.
    for(const key of [...headers.keys()])if(key.startsWith('oai-authenticated-'))headers.delete(key);
-   const response=await worker.fetch(new Request('http://localhost:3000'+req.url,{method:req.method,headers,body:['GET','HEAD'].includes(req.method)?undefined:Buffer.concat(chunks)}),{DB,ADMIN_EMAIL:process.env.ADMIN_EMAIL||''});
+   const response=await worker.fetch(new Request('http://localhost:3000'+req.url,{method:req.method,headers,body:['GET','HEAD'].includes(req.method)?undefined:Buffer.concat(chunks)}),{DB,ADMIN_EMAIL:process.env.ADMIN_EMAIL||'',SHARED_START_LIMIT_PER_MINUTE:process.env.SHARED_START_LIMIT_PER_MINUTE||''});
    res.writeHead(response.status,Object.fromEntries(response.headers));res.end(Buffer.from(await response.arrayBuffer()));
   }catch{res.writeHead(500);res.end('Preview unavailable');}
  }).listen(3000,'127.0.0.1',()=>console.log('Local: http://localhost:3000/'));

@@ -38,33 +38,74 @@ function bad(message,status=400){return json({error:message},status);}
 const preferenceKeys=/^snake_(nickname|difficulty|map|skin|cosmetic|sound_enabled|countdown_enabled|touch_sensitivity|reduce_motion|tutorial_choice_v1)$/;
 function guestIdentity(request){const cookie=request.headers.get('cookie')?.match(/(?:^|;\s*)snake_player=([^;]+)/)?.[1];return uuid.test(cookie||'')?cookie:null;}
 function dayString(time=Date.now()){return new Date(time).toISOString().slice(0,10);}
+const SHARED_NETWORK='guest-network-unavailable';
+// Returns the quota bucket for a new run. `shared` marks guests whose network address is unknown.
 async function networkRateKey(request,db,account){
   // Cloudflare supplies this header; never trust X-Forwarded-For or the player cookie.
   let ip=request.headers.get('cf-connecting-ip')||'';
   if(ip.includes(':')){try{const normalized=new URL('http://['+ip+']/').hostname.replace(/[\[\]]/g,''),halves=normalized.split('::'),left=halves[0]?halves[0].split(':'):[],right=halves[1]?halves[1].split(':'):[];const parts=halves.length===2?[...left,...Array(8-left.length-right.length).fill('0'),...right]:left;if(parts.length!==8)throw Error();ip=parts.slice(0,4).map(p=>p.padStart(4,'0')).join(':');}catch{ip='';}}
   else if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)||ip.split('.').some(p=>Number(p)>255))ip='';
-  const source=ip||account||'guest-network-unavailable';
-  return keyedHash(db,'rate_secret',source);
+  const source=ip||account||SHARED_NETWORK;
+  return {key:await keyedHash(db,'rate_secret',source),shared:source===SHARED_NETWORK};
 }
+// Guests without a network address share one bucket. Its per-minute size is a deployment
+// setting so it can follow measured traffic (see the admin traffic summary).
+function sharedStartLimit(env){const value=Number(env.SHARED_START_LIMIT_PER_MINUTE);return Number.isInteger(value)&&value>=1&&value<=100000?value:DEFAULT_SHARED_START_LIMIT;}
 // Server-side secrets are created once and stay in the database; they are never sent to clients.
-const secretNames=new Set(['rate_secret','player_code_secret']);
-async function keyedHash(db,name,value){
+// Imported keys are kept per database binding, so listing many players costs no extra queries.
+const secretNames=new Set(['rate_secret','player_code_secret']),secretKeys=new WeakMap();
+function secretKey(db,name){
   if(!secretNames.has(name))throw new Error('Unknown secret');
-  await db.prepare("INSERT OR IGNORE INTO security_state (key,value) VALUES (?,?)").bind(name,crypto.randomUUID()+crypto.randomUUID()).run();
-  const secret=await db.prepare("SELECT value FROM security_state WHERE key=?").bind(name).first();
-  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(secret.value),{name:'HMAC',hash:'SHA-256'},false,['sign']);
-  return [...new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(value)))].map(b=>b.toString(16).padStart(2,'0')).join('');
+  let keys=secretKeys.get(db);if(!keys)secretKeys.set(db,keys=new Map());
+  if(!keys.has(name)){
+    const loading=(async()=>{
+      await db.prepare("INSERT OR IGNORE INTO security_state (key,value) VALUES (?,?)").bind(name,crypto.randomUUID()+crypto.randomUUID()).run();
+      const secret=await db.prepare("SELECT value FROM security_state WHERE key=?").bind(name).first();
+      return crypto.subtle.importKey('raw',new TextEncoder().encode(secret.value),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+    })();
+    keys.set(name,loading);loading.catch(()=>keys.delete(name));
+  }
+  return keys.get(name);
+}
+async function keyedHash(db,name,value){
+  return [...new Uint8Array(await crypto.subtle.sign('HMAC',await secretKey(db,name),new TextEncoder().encode(value)))].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 // Keyed, so a known account or guest identifier cannot be matched to a public code offline.
 async function playerCode(db,playerId){return (await keyedHash(db,'player_code_secret',playerId)).slice(0,16).toUpperCase();}
-// Invisible, direction-changing and control characters allow look-alike names.
-function cleanNickname(value){return typeof value==='string'?value.normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim():'';}
-const LEADERBOARD_TTL=30000,STALE_RUN_AGE=7*86400000,CLEANUP_INTERVAL=3600000;
-let leaderboardCache=null,lastCleanup=0;
-// Abandoned runs can no longer be finished after three hours; drop them after a week.
+// Invisible, direction-changing and control characters allow look-alike names. The same
+// cleaning is applied when a name is stored and when an older stored name is shown.
+function cleanNickname(value){
+  if(typeof value!=='string')return '';
+  const cleaned=value.slice(0,200).normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim();
+  let name='';for(const character of cleaned){if(name.length+character.length>15)break;name+=character;}
+  return name.trim();
+}
+function shownNickname(value){return cleanNickname(value)||'Oyuncu';}
+const DEFAULT_SHARED_START_LIMIT=120,LEADERBOARD_TTL=30000,STALE_RUN_AGE=7*86400000,CLEANUP_INTERVAL=3600000;
+const REVIEW_MIN_SCORE=100,REVIEW_MAX_ROWS=50,REVIEW_MAX_BYTES=131072,REVIEW_RETENTION=30*86400000,COUNTER_RETENTION=30*86400000;
+let leaderboardCache=null,leaderboardGeneration=0,lastCleanup=0;
+// Drops this instance's copy. Results that are still being loaded are not stored afterwards.
+function forgetLeaderboard(){leaderboardCache=null;leaderboardGeneration++;}
+// Hourly housekeeping: abandoned runs cannot be finished after three hours and go after a week;
+// stored move records and rejection counters go after thirty days.
 async function removeStaleRuns(db,now){
   if(now-lastCleanup<CLEANUP_INTERVAL)return;lastCleanup=now;
-  try{await db.prepare('DELETE FROM game_runs WHERE finished_at IS NULL AND started_at<?').bind(now-STALE_RUN_AGE).run();}catch(error){console.error('Stale run cleanup failed',error?.message);}
+  try{
+    await db.prepare('DELETE FROM game_runs WHERE finished_at IS NULL AND started_at<?').bind(now-STALE_RUN_AGE).run();
+    await db.prepare('DELETE FROM run_replays WHERE stored_at<?').bind(now-REVIEW_RETENTION).run();
+    await db.prepare("DELETE FROM security_state WHERE key>='start_rejected:' AND key<?").bind('start_rejected:'+dayString(now-COUNTER_RETENTION)).run();
+  }catch(error){console.error('Housekeeping failed',error?.message);}
+}
+// Keeps the moves of only the highest verified scores so the owner can review suspected bots.
+async function storeReview(db,id,score,input,now){
+  if(score<REVIEW_MIN_SCORE)return;
+  try{
+    const kept=await db.prepare('SELECT COUNT(*) AS n, MIN(score) AS low FROM run_replays').first();
+    if(kept.n>=REVIEW_MAX_ROWS&&score<=kept.low)return;
+    const moves=JSON.stringify(input.moves),bytes=new TextEncoder().encode(moves).length;
+    await db.prepare('INSERT OR IGNORE INTO run_replays (run_id,score,ticks,moves,bytes,stored_at) VALUES (?,?,?,?,?,?)').bind(id,score,input.ticks,bytes>REVIEW_MAX_BYTES?null:moves,bytes,now).run();
+    await db.prepare('DELETE FROM run_replays WHERE run_id NOT IN (SELECT run_id FROM run_replays ORDER BY score DESC, stored_at DESC, run_id ASC LIMIT ?)').bind(REVIEW_MAX_ROWS).run();
+  }catch(error){console.error('Move record not stored',error?.message);}
 }
 function questsForDay(date){const pool=[...QUEST_POOL],random=seededRandom(Number(date.replaceAll('-','')));for(let i=pool.length-1;i>0;i--){const j=Math.floor(random()*(i+1));[pool[i],pool[j]]=[pool[j],pool[i]];}return pool.slice(0,3);}
 async function readProgress(env,player){
@@ -90,9 +131,9 @@ function emptyProgress(){
 async function start(request,env) {
   const input=await body(request);
   if(Object.hasOwn(input,'accountKey')&&input.accountKey!==await accountId(request))return bad('Açık hesap değişti. Sayfayı yenile.',409);
-  const nickname=cleanNickname(input.nickname);
+  const nickname=typeof input.nickname==='string'&&input.nickname.length<=200?cleanNickname(input.nickname):'';
   if(input.skin!==undefined&&!['blue','green','red','purple','gold','rainbow'].includes(input.skin)||input.cosmetic!==undefined&&!['none','crown','sunglasses','tophat','cap','bow'].includes(input.cosmetic))return bad('Görünüm seçimi geçersiz.');
-  if(!nickname||nickname.length>15||!maps.has(input.map)||!difficulties.has(input.difficulty)||!uuid.test(input.id||'')||!uuid.test(input.token||''))return bad('Oyuncu adı veya oyun ayarları geçersiz.');
+  if(!nickname||!maps.has(input.map)||!difficulties.has(input.difficulty)||!uuid.test(input.id||'')||!uuid.test(input.token||''))return bad('Oyuncu adı veya oyun ayarları geçersiz.');
   const db=database(env),now=Date.now(),tokenHash=await hash(input.token);
   await removeStaleRuns(db,now);
   const account=await accountId(request),guestId=guestIdentity(request)||crypto.randomUUID(),playerId=account||guestId;
@@ -100,10 +141,14 @@ async function start(request,env) {
   const existing=await db.prepare('SELECT * FROM game_runs WHERE id=?').bind(input.id).first();
   if(existing){if(existing.token_hash!==tokenHash||existing.map!==input.map||existing.difficulty!==input.difficulty||(existing.player_id.startsWith('account:')?existing.player_id!==account:!!account))return bad('Oyun kimliği kullanımda.',409);if(![1,2,RULES_VERSION].includes(existing.rules_version))return bad('Eski oyun kaydı. Yeni bir oyun başlat.',409);return responseFor(existing);}
   if(input.rulesVersion!==RULES_VERSION)return bad('Oyun güncellendi. Sayfayı yenileyip yeni bir oyun başlat.',409);
-  const rateKey=await networkRateKey(request,db,account),seed=crypto.getRandomValues(new Uint32Array(1))[0],cosmetic=input.skin&&input.skin!=='blue'||input.cosmetic&&input.cosmetic!=='none'?'styled':'plain';
-  const result=await db.prepare('INSERT OR IGNORE INTO game_runs (id,player_id,token_hash,nickname,map,difficulty,started_at,seed,rules_version,rate_key,cosmetic,quest_date) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<12 AND (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<12 AND (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<300').bind(input.id,playerId,tokenHash,nickname,input.map,input.difficulty,now,seed,RULES_VERSION,rateKey,cosmetic,dayString(now),rateKey,now-60000,playerId,now-60000,rateKey,now-86400000).run();
+  const rate=await networkRateKey(request,db,account),rateKey=rate.key,seed=crypto.getRandomValues(new Uint32Array(1))[0],cosmetic=input.skin&&input.skin!=='blue'||input.cosmetic&&input.cosmetic!=='none'?'styled':'plain';
+  const result=await db.prepare('INSERT OR IGNORE INTO game_runs (id,player_id,token_hash,nickname,map,difficulty,started_at,seed,rules_version,rate_key,cosmetic,quest_date) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<? AND (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<12 AND (? OR (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<300)').bind(input.id,playerId,tokenHash,nickname,input.map,input.difficulty,now,seed,RULES_VERSION,rateKey,cosmetic,dayString(now),rateKey,now-60000,rate.shared?sharedStartLimit(env):12,playerId,now-60000,rate.shared?1:0,rateKey,now-86400000).run();
   const stored=await db.prepare('SELECT * FROM game_runs WHERE id=?').bind(input.id).first();
-  if(!stored)return bad('Yeni oyun sınırına ulaşıldı. Biraz sonra tekrar dene veya antrenman modunu kullan.',429);
+  if(!stored){
+    // Counted per day so the shared limit can be tuned from real traffic.
+    try{await db.prepare("INSERT INTO security_state (key,value) VALUES (?,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").bind('start_rejected:'+dayString(now)+(rate.shared?':shared':':network')).run();}catch(error){console.error('Rejection not counted',error?.message);}
+    return bad('Yeni oyun sınırına ulaşıldı. Biraz sonra tekrar dene veya antrenman modunu kullan.',429);
+  }
   if(stored.token_hash!==tokenHash)return bad('Oyun kimliği kullanımda.',409);
   return responseFor(stored);
 }
@@ -123,9 +168,10 @@ async function finish(request,env,id) {
     console.error('Replay verification failed unexpectedly',error?.message);return bad('Hamle kaydı doğrulanamadı.');
   }
   const rewards={...replay.rewards,achievements:Object.fromEntries(replay.rewards.achievements.map(k=>[k,1]))};if(run.cosmetic==='styled')rewards.achievements.fashion_icon=1;
-  await db.prepare('UPDATE game_runs SET finished_at=?,score=?,duration_seconds=?,outcome=?,verified=1,proof_hash=?,rewards=? WHERE id=? AND finished_at IS NULL').bind(now,replay.score,Math.floor(replay.elapsed/1000),input.outcome,proofHash,JSON.stringify(rewards),id).run();
+  const update=await db.prepare('UPDATE game_runs SET finished_at=?,score=?,duration_seconds=?,outcome=?,verified=1,proof_hash=?,rewards=? WHERE id=? AND finished_at IS NULL').bind(now,replay.score,Math.floor(replay.elapsed/1000),input.outcome,proofHash,JSON.stringify(rewards),id).run();
   const saved=await db.prepare('SELECT proof_hash,score FROM game_runs WHERE id=?').bind(id).first();if(saved.proof_hash!==proofHash)return bad('Bu oyun zaten kaydedildi.',409);
-  leaderboardCache=null;
+  forgetLeaderboard();
+  if(Number(update.meta?.changes??update.changes))await storeReview(db,id,replay.score,input,now);
   return json({saved:true,score:saved.score,progress:await readProgress(env,run.player_id)});
 }
 async function admin(request,env,url){
@@ -138,14 +184,29 @@ async function admin(request,env,url){
   if(search){where.push("nickname LIKE ? ESCAPE '\\'");values.push('%'+search.replace(/[\\%_]/g,'\\$&')+'%');}
   if(map){where.push('map = ?');values.push(map);}
   const clause=where.length?' WHERE '+where.join(' AND '):'';
-  const db=database(env);
-  const [summary,count,rows]=await Promise.all([
+  const db=database(env),now=Date.now(),day=now-86400000,sharedKey=await keyedHash(db,'rate_secret',SHARED_NETWORK);
+  const [summary,count,rows,starts,peak,sharedPeak,rejected]=await Promise.all([
     db.prepare("SELECT COUNT(*) AS total_games, COUNT(DISTINCT player_id) AS players, COUNT(finished_at) AS finished_games, COALESCE(MAX(CASE WHEN verified=1 THEN score END),0) AS best_score FROM game_runs").first(),
     db.prepare('SELECT COUNT(*) AS count FROM game_runs'+clause).bind(...values).first(),
-    db.prepare('SELECT id, player_id, nickname, map, difficulty, started_at, finished_at, score, duration_seconds, outcome, verified FROM game_runs'+clause+' ORDER BY started_at DESC, id DESC LIMIT 50 OFFSET ?').bind(...values,(page-1)*50).all(),
+    db.prepare('SELECT id, player_id, nickname, map, difficulty, started_at, finished_at, score, duration_seconds, outcome, verified, EXISTS(SELECT 1 FROM run_replays WHERE run_id=game_runs.id) AS has_replay FROM game_runs'+clause+' ORDER BY started_at DESC, id DESC LIMIT 50 OFFSET ?').bind(...values,(page-1)*50).all(),
+    db.prepare('SELECT COUNT(*) AS total, COALESCE(SUM(rate_key=?),0) AS shared FROM game_runs WHERE started_at>?').bind(sharedKey,day).first(),
+    db.prepare('SELECT COALESCE(MAX(n),0) AS n FROM (SELECT COUNT(*) AS n FROM game_runs WHERE started_at>? GROUP BY started_at/60000)').bind(day).first(),
+    db.prepare('SELECT COALESCE(MAX(n),0) AS n FROM (SELECT COUNT(*) AS n FROM game_runs WHERE started_at>? AND rate_key=? GROUP BY started_at/60000)').bind(day,sharedKey).first(),
+    db.prepare("SELECT key,value FROM security_state WHERE key IN (?,?)").bind('start_rejected:'+dayString(now)+':shared','start_rejected:'+dayString(now)+':network').all(),
   ]);
-  const runs=await Promise.all(rows.results.map(async ({player_id,...run})=>({...run,player_code:await playerCode(db,player_id)})));
-  return json({summary,total:count.count,page,pageSize:50,runs});
+  const rejectedToday=kind=>Number(rejected.results.find(r=>r.key.endsWith(':'+kind))?.value||0);
+  // Starts in the last 24 hours; "shared" means guests whose network address was not available.
+  const traffic={starts24h:starts.total,sharedStarts24h:Number(starts.shared),peakPerMinute:peak.n,sharedPeakPerMinute:sharedPeak.n,sharedLimitPerMinute:sharedStartLimit(env),rejectedToday:{shared:rejectedToday('shared'),network:rejectedToday('network')}};
+  const runs=await Promise.all(rows.results.map(async ({player_id,nickname,has_replay,...run})=>({...run,nickname:shownNickname(nickname),has_replay:!!has_replay,player_code:await playerCode(db,player_id)})));
+  return json({summary,total:count.count,page,pageSize:50,runs,traffic});
+}
+async function replayRecord(request,env,id){
+  if(!owner(request,env))return bad('Bu ekran yalnızca site sahibine açıktır.',request.headers.get('oai-authenticated-user-id')?403:401);
+  if(!uuid.test(id))return bad('Geçersiz kayıt.');
+  const row=await database(env).prepare('SELECT g.id,g.nickname,g.map,g.difficulty,g.seed,g.rules_version,g.outcome,g.started_at,g.finished_at,r.score,r.ticks,r.moves,r.bytes,r.stored_at FROM run_replays r JOIN game_runs g ON g.id=r.run_id WHERE r.run_id=?').bind(id).first();
+  if(!row)return bad('Bu oyun için saklanan hamle kaydı yok.',404);
+  const {nickname,moves,...record}=row;
+  return json({...record,nickname:shownNickname(nickname),moves:moves===null?null:JSON.parse(moves),note:moves===null?'Hamle kaydı boyut sınırını aştığı için saklanmadı.':undefined});
 }
 async function accountId(request){
   const id=request.headers.get('oai-authenticated-user-id');
@@ -155,6 +216,7 @@ async function readProfile(request,env){
   const id=await accountId(request);if(!id)return null;
   const row=await database(env).prepare('SELECT data, revision FROM player_profiles WHERE account_id = ?').bind(id).first();
   const preferences=Object.fromEntries(Object.entries(row?JSON.parse(row.data):{}).filter(([key])=>preferenceKeys.test(key)));
+  if(typeof preferences.snake_nickname==='string')preferences.snake_nickname=cleanNickname(preferences.snake_nickname);
   return {key:id,data:{...preferences,...await readProgress(env,id)},revision:row?.revision||0};
 }
 async function saveProfile(request,env){
@@ -162,6 +224,7 @@ async function saveProfile(request,env){
   const input=await body(request,65536),data=input.data;
   if(input.accountKey!==id)return bad('Açık hesap değişti. Sayfayı yenile.',409);
   if(!data||typeof data!=='object'||Array.isArray(data)||Object.entries(data).some(([k,v])=>!preferenceKeys.test(k)||typeof v!=='string'||v.length>200)||!Number.isSafeInteger(input.revision)||input.revision<0)return bad('Yalnızca ad ve oyun tercihleri kaydedilebilir. XP, başarımlar ve skor sunucuda hesaplanır.');
+  if(Object.hasOwn(data,'snake_nickname'))data.snake_nickname=cleanNickname(data.snake_nickname);
   const db=database(env);
   const existing=await db.prepare('SELECT data FROM player_profiles WHERE account_id=?').bind(id).first();
   const preserved={...(existing?JSON.parse(existing.data):{}),...data};
@@ -171,13 +234,16 @@ async function saveProfile(request,env){
   if(!Number(result.meta?.changes??result.changes))return bad('Kayıt başka bir cihazda değişti. Sayfayı yenileyerek güncel kaydı yükle.',409);
   return json({revision:input.revision+1});
 }
+async function leaderboardEpoch(db){return (await db.prepare("SELECT value FROM security_state WHERE key='leaderboard_epoch'").first())?.value||'';}
 async function leaderboard(env){
-  // The ranking scans every verified run, so one result is shared for a short time.
-  const now=Date.now();
-  if(leaderboardCache&&now>=leaderboardCache.time&&now-leaderboardCache.time<LEADERBOARD_TTL)return json({scores:leaderboardCache.scores});
-  const db=database(env),rows=await db.prepare('SELECT player_id, nickname, score, map, difficulty, finished_at FROM (SELECT id, player_id, nickname, score, map, difficulty, finished_at, ROW_NUMBER() OVER (PARTITION BY player_id, map, difficulty ORDER BY score DESC, finished_at ASC, id ASC) AS position FROM game_runs WHERE verified=1 AND finished_at IS NOT NULL AND score > 0) WHERE position = 1 ORDER BY score DESC, finished_at ASC, id ASC LIMIT 20').all();
-  const scores=await Promise.all(rows.results.map(async r=>({name:r.nickname,score:r.score,map:r.map,diff:r.difficulty,date:new Date(r.finished_at).toLocaleDateString('tr-TR'),playerCode:await playerCode(db,r.player_id)})));
-  leaderboardCache={time:now,scores};
+  // The ranking scans every verified run, so one result is shared for a short time. A deletion
+  // changes the stored epoch, which every instance checks with one key lookup before reusing its copy.
+  const db=database(env),now=Date.now(),epoch=await leaderboardEpoch(db),cached=leaderboardCache;
+  if(cached&&cached.db===db&&cached.epoch===epoch&&now>=cached.time&&now-cached.time<LEADERBOARD_TTL)return json({scores:cached.scores});
+  const generation=leaderboardGeneration,rows=await db.prepare('SELECT player_id, nickname, score, map, difficulty, finished_at FROM (SELECT id, player_id, nickname, score, map, difficulty, finished_at, ROW_NUMBER() OVER (PARTITION BY player_id, map, difficulty ORDER BY score DESC, finished_at ASC, id ASC) AS position FROM game_runs WHERE verified=1 AND finished_at IS NOT NULL AND score > 0) WHERE position = 1 ORDER BY score DESC, finished_at ASC, id ASC LIMIT 20').all();
+  const scores=await Promise.all(rows.results.map(async r=>({name:shownNickname(r.nickname),score:r.score,map:r.map,diff:r.difficulty,date:new Date(r.finished_at).toLocaleDateString('tr-TR'),playerCode:await playerCode(db,r.player_id)})));
+  // Skip storing when a score was saved or deleted while this result was being loaded.
+  if(generation===leaderboardGeneration&&epoch===await leaderboardEpoch(db))leaderboardCache={db,time:now,epoch,scores};
   return json({scores});
 }
 async function deleteRuns(request,env){
@@ -185,8 +251,12 @@ async function deleteRuns(request,env){
   const input=await body(request);
   if(!Array.isArray(input.ids)||input.ids.length<1||input.ids.length>50||input.ids.some(id=>typeof id!=='string'||!uuid.test(id)))return bad('1 ile 50 arasında geçerli kayıt seçmelisin.');
   const ids=[...new Set(input.ids)];
-  const result=await database(env).prepare('DELETE FROM game_runs WHERE id IN ('+ids.map(()=>'?').join(',')+')').bind(...ids).run();
-  leaderboardCache=null;
+  const db=database(env),marks=ids.map(()=>'?').join(',');
+  const result=await db.prepare('DELETE FROM game_runs WHERE id IN ('+marks+')').bind(...ids).run();
+  await db.prepare('DELETE FROM run_replays WHERE run_id IN ('+marks+')').bind(...ids).run();
+  // Other instances notice the new epoch and stop serving the deleted score from their copy.
+  await db.prepare("INSERT INTO security_state (key,value) VALUES ('leaderboard_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(crypto.randomUUID()).run();
+  forgetLeaderboard();
   return json({deleted:Number(result.meta?.changes??result.changes??0)});
 }
 async function securityReport(request,env){
@@ -228,6 +298,8 @@ const app = {
     return html(adminHTML,200,false);
    }
    if(request.method==='GET'&&url.pathname==='/api/admin/runs')return await admin(request,env,url);
+   const replayMatch=url.pathname.match(/^\/api\/admin\/runs\/([^/]+)\/replay$/);
+   if(request.method==='GET'&&replayMatch)return await replayRecord(request,env,replayMatch[1]);
    if(request.method==='GET'&&url.pathname==='/api/leaderboard')return await leaderboard(env);
    if(request.method==='POST'&&url.pathname==='/api/admin/runs/delete')return await deleteRuns(request,env);
    if(request.method==='POST'&&url.pathname==='/api/runs')return await start(request,env);
@@ -245,6 +317,12 @@ export default {async fetch(request,env){
   const url=new URL(request.url);
   if(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)){
     url.protocol='https:';return secureResponse(new Response(null,{status:308,headers:{Location:url.href}}),request);
+  }
+  // Identity headers count only where the deployment states that its platform sets them and
+  // removes any copy sent by a visitor. This switch does not authenticate anyone by itself.
+  if(env?.TRUST_PLATFORM_IDENTITY!=='1'&&[...request.headers.keys()].some(name=>name.startsWith('oai-authenticated-'))){
+    const headers=new Headers(request.headers);for(const name of [...headers.keys()])if(name.startsWith('oai-authenticated-'))headers.delete(name);
+    request=new Request(request,{headers});
   }
   const routed=request.method==='HEAD'?new Request(request,{method:'GET'}):request;
   return secureResponse(await app.fetch(routed,env),request);

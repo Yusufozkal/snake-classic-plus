@@ -1220,6 +1220,8 @@
             window.addEventListener('beforeunload',e=>{if(profileDirty||profileSaving){e.preventDefault();e.returnValue='';}});
         }
         function readJSON(key, fallback) { try { return JSON.parse(storage.getItem(key)) ?? fallback; } catch { return fallback; } }
+        // Same cleaning as the server: no invisible or direction-changing characters, at most 15 characters.
+        const cleanNickname = value=>{const cleaned=String(value??'').slice(0,200).normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim();let name='';for(const character of cleaned){if(name.length+character.length>15)break;name+=character;}return name.trim();};
         const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
         // Ses Notaları
@@ -1461,7 +1463,8 @@
             { name: "Kozmik Leviathan", icon: "⚡", minXp: 12000, bg: "#0369a1", color: "#7dd3fc" }
         ]);
 
-        let playerNickname = storage.getItem('snake_nickname') || '';
+        // Names saved before the cleaning rule are corrected when they are loaded.
+        let playerNickname = cleanNickname(storage.getItem('snake_nickname') || '');
         let playerXp = parseInt(storage.getItem('snake_player_xp')) || 0;
 
         function getPlayerRankData(xp = playerXp) {
@@ -1538,7 +1541,7 @@
         }
 
         function saveNickname() {
-            const val = nicknameInput.value.normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim().slice(0,15);
+            const val = cleanNickname(nicknameInput.value);
             if (val.length > 0) {
                 playerNickname = val;
                 storage.setItem('snake_nickname', playerNickname);

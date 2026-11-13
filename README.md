@@ -55,7 +55,17 @@ Testler; skor sahteciliğini, hamle doğrulamasını, istek sınırlarını, hes
 
 ## Hesap ve barındırma
 
-Yerel sunucuda misafir olarak oynanır. ChatGPT ile giriş ve yönetici erişimi, özgün barındırma ortamının doğrulanmış kimlik entegrasyonuna bağlıdır. Yerel adaptör, istemciden gelen kimlik başlıklarını siler; yalnızca `ADMIN_EMAIL` tanımlamak yönetici erişimi sağlamaz. `.env.example` sadece örnektir; sunucu `.env` dosyasını otomatik yüklemez.
+Yerel sunucuda misafir olarak oynanır. ChatGPT ile giriş ve yönetici erişimi, özgün barındırma ortamının doğrulanmış kimlik entegrasyonuna bağlıdır. Yerel adaptör, istemciden gelen kimlik başlıklarını siler; yalnızca `ADMIN_EMAIL` tanımlamak yönetici erişimi sağlamaz.
+
+### Ortam değişkenleri
+
+| Değişken | Anlamı |
+| --- | --- |
+| `ADMIN_EMAIL` | Yönetici ekranını açabilecek hesabın e-postası. |
+| `TRUST_PLATFORM_IDENTITY` | Yalnızca `1` olduğunda `oai-authenticated-*` kimlik başlıkları dikkate alınır. Sites yayınında `1` olmalıdır; aksi hâlde herkes misafir sayılır ve yönetici ekranı kapalı kalır. |
+| `SHARED_START_LIMIT_PER_MINUTE` | Ağ adresi alınamayan misafirlerin ortak olarak dakikada başlatabileceği oyun sayısı (varsayılan 120). Yönetici ekranındaki trafik özetine göre ayarlanır. |
+
+`TRUST_PLATFORM_IDENTITY` bir kimlik doğrulama yöntemi **değildir**. Yalnızca "bu ortamda başlıkları platform yazıyor ve ziyaretçiden gelen kopyaları siliyor" beyanıdır; başlıkların gerçekliğini denetlemez. Ziyaretçinin bu başlıkları kendisinin gönderebildiği bir sunucuda `1` yapılırsa herkes istediği hesap ve yönetici gibi davranabilir. Amacı, kod başka bir ortama kopyalandığında varsayılan olarak kapalı kalmasıdır. `.env.example` sadece örnektir; sunucu `.env` dosyasını otomatik yüklemez.
 
 Başka bir sağlayıcıya dağıtırken kimlik doğrulamasını o ortama uyarlamak ve veritabanını bağlamak gerekir. Mevcut Worker, güvenilir platformun kimlik başlıklarını esas alır; bu uçları aynı başlıkları ziyaretçinin belirleyebildiği bir sunucuda doğrudan yayınlamayın.
 
