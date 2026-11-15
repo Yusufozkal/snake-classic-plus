@@ -139,7 +139,7 @@ Yerel sunucuda misafir olarak oynanır. ChatGPT ile giriş ve yönetici erişimi
 
 Başka bir sağlayıcıya dağıtırken kimlik doğrulamasını o ortama uyarlamak ve veritabanını bağlamak gerekir. Worker, kimlik başlıklarını varsayılan olarak yok sayar; `TRUST_PLATFORM_IDENTITY=1` yalnızca başlıkları güvenilir biçimde doğrulayan platformda açılmalıdır. Güvenilir IP kaynağı da ayrıca yapılandırılır. [Güvenlik ayarları ve kayıt sınırları](SECURITY.md) dağıtım öncesinde kontrol edilmelidir.
 
-Ağ adresi olmayan misafirlerin ortak başlatma sınırı `SHARED_START_LIMIT_PER_MINUTE` ile ayarlanır; yönetici ekranındaki trafik özeti bu değeri gerçek trafiğe göre seçmene yardım eder. Siteyi bir bütün olarak sayan bir üst sınır yoktur. Yüksek skorların hamleleri bot incelemesi için 30 gün saklanır.
+Ağ adresi olmayan misafirlerin ortak başlatma sınırı `SHARED_START_LIMIT_PER_MINUTE` ile ayarlanır; yönetici ekranındaki trafik özeti bu değeri gerçek trafiğe göre seçmene yardım eder. Siteyi bir bütün olarak sayan bir üst sınır yoktur. Yüksek skorların hamleleri bot incelemesi için 30 gün saklanır; sahibi bir kaydı açtığında bilgi amaçlı inceleme sinyalleri (yön değişimi sıklığı, duraklamalar, önceki saatteki terk edilmiş başlangıçlar) de görür. Yönetici ekranı eksik migration'ları ve eksik veya çalışmayan `TRUSTED_IP_HEADER` ayarını "Dağıtım uyarıları" kutusunda bildirir. Oyuncu ilerlemesi kısa süre önbelleğe alınır; ayrıntılar [SECURITY.md](SECURITY.md) içindedir.
 
 Tam oyun bir sunucu ve veritabanı gerektirir; **GitHub Pages tek başına yeterli değildir.** `build-static.cjs` / `serve-static.cjs` tam uygulamanın yerine geçmez.
 

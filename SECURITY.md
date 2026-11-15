@@ -19,6 +19,22 @@ Worker, `oai-authenticated-*` başlıklarını varsayılan olarak yok sayar. `TR
 
 Limitler tek atomik veritabanı eklemesinde denetlenir. Ortak kovanın boyutunu gerçek trafiğe göre ayarlamak için yönetici ekranı son 24 saatteki başlatma sayısını, ortak kovanın payını, en yoğun dakikayı ve gün içinde sınıra takılan istekleri (`security_state` içinde `start_rejected:<tarih>:shared` ve `:network`, 30 gün sonra silinir) gösterir. Bunlar gelen ağ trafiğinin tamamını sınırlandırmaz; yüksek hacimli saldırılar için hosting katmanında koruma gerekir. Antrenman modu sıralamaya kayıt açmaz. Bir haftadan eski bitirilmemiş oyunlar temizlenir; bitmiş oyun geçmişi korunur.
 
+## Sorgu maliyeti ve temizlik
+
+- Oyuncu ilerlemesi (`GET /` ve `GET /api/profile`) üç toplama sorgusu çalıştırır. Worker örneği başına küçük bir önbellek sonucu yaklaşık 15 saniye tutar (en fazla 500 oyuncu, en eski kayıt önce silinir; veritabanı bağlantısı başına). Oyuncunun bir oyunu kaydedilince kendi girdisi silinir, sahibi oyun sildiğinde tüm girdiler silinir. `finish()` yanıtındaki ilerleme her zaman yeniden hesaplanır. Sınır: başka bir Worker örneğindeki önbellek, oyuncunun oyunu bitiren örnekte kaydettiği skoru en çok 15 saniye geç görebilir.
+- Saatlik temizlik (bitirilmemiş eski oyunlar, eski hamle kayıtları, eski sayaçlar) yalnızca oyun başlatılınca değil, ana sayfa ve skor listesi istekleriyle de tetiklenir. Temizlik hatası isteği başarısız yapmaz; her adım ayrı çalışır, bir tablo eksikse diğer adımlar durmaz.
+
+## Dağıtım kontrolleri (yönetici ekranı)
+
+`GET /api/admin/runs` yanıtındaki `checks` dizisi ve yönetici ekranındaki turuncu "Dağıtım uyarıları" kutusu şunları bildirir; her şey yolundaysa dizi boştur:
+
+- `leaderboard_insert`, `leaderboard_update` veya `leaderboard_delete` tetikleyicisi yok (migration 0004 uygulanmamış).
+- `run_replays` tablosu yok (migration 0005 uygulanmamış). Worker bu durumda çalışmaya devam eder: yönetici listesi, silme ve hamle kaydı okuma tabloyu bulamasa da hata vermez (hamle kaydı saklanmaz, "Hamleler" bağlantısı görünmez).
+- `TRUSTED_IP_HEADER` ayarlı değil veya kabul edilen değerlerden biri değil: tüm misafirler tek ortak sınırı paylaşır. Sites üzerinde değer `cf-connecting-ip` olmalıdır.
+- `TRUSTED_IP_HEADER` ayarlı, ama son 24 saatteki en az 20 başlatmanın hepsi ortak kovaya düşmüş: başlık isteklere ulaşmıyor olabilir.
+
+Kontroller trafik özetiyle aynı sorguda hesaplanır; liste sorgu sayısı satır sayısına bağlı değildir.
+
 ## Skorlar ve oyuncu kodları
 
 Skor, süre, XP, görev ve başarımlar sunucuda kaydedilen hamlelerin yeniden oynatılmasıyla hesaplanır. Eski oyunlar kayıtlı kural sürümüyle doğrulanır. Bu kontrol otomatik oynayan bir botu insan oyuncudan kesin olarak ayıramaz.
@@ -29,8 +45,8 @@ Skor önbelleği, veritabanı tetikleyicilerinin güncellediği sürümü kontro
 
 ## Bot incelemesi için hamle kayıtları
 
-Doğrulanmış bir skor en az 100 puansa ve saklanan en yüksek 50 kayıt arasına girerse hamleleri `run_replays` tablosunda tutulur (en düşük skor önce silinir). Her kayıt en fazla 131072 bayt JSON'dur; daha büyükse yalnızca boyutu saklanır. Kayıtlar 30 gün sonra saatlik temizlikte ve sahibi ilgili oyunu sildiğinde silinir. `GET /api/admin/runs/:id/replay` yalnızca site sahibine açıktır ve oyuncu kimliğini döndürmez. Kayıt saklanamazsa skor kaydı yine de başarılı olur. `drizzle/0005_*.sql` migration dosyasını Worker güncellemesinden önce uygula.
+Doğrulanmış bir skor en az 100 puansa ve saklanan en yüksek 50 kayıt arasına girerse hamleleri `run_replays` tablosunda tutulur (en düşük skor önce silinir). Her kayıt en fazla 131072 bayt JSON'dur; daha büyükse yalnızca boyutu saklanır. Kayıtlar 30 gün sonra saatlik temizlikte ve sahibi ilgili oyunu sildiğinde silinir. `GET /api/admin/runs/:id/replay` yalnızca site sahibine açıktır ve oyuncu kimliğini döndürmez. `GET /api/admin/runs/:id/replay` yanıtı ayrıca bilgi amaçlı bir `signals` nesnesi içerir: adım sayısı, yön değişimi sayısı ve her 100 adımdaki oranı, her 100 adımdaki skor, aktif oyun süresi ile başlangıç-bitiş arasındaki süre (uzun fark uzun duraklamalar demektir), aynı oyuncunun bu oyundan önceki saatte başlattığı oyun sayısı ve bunlardan bitirilmeyen veya yeniden başlatılanların sayısı (bitiş öncesi çok sayıda terk edilmiş başlangıç, uygun bir tohum aranmış olabileceğini düşündürür) ve olağan dışı görünenler için kısa Türkçe `notes`. Eşikler `server/worker.js` içinde `SIGNAL_*` sabitleridir ve sezgiseldir; yalnızca sahibin incelemesine yardım eder, hiçbir skoru engellemez veya değiştirmez. Oyuncu kimliği döndürülmez. Kayıt saklanamazsa skor kaydı yine de başarılı olur. `drizzle/0005_*.sql` migration dosyasını Worker güncellemesinden önce uygula.
 
 ## Kontroller
 
-`npm run test:security` yetkilendirme, sahte skor, atomik kotalar (ortak misafir kovasının kimseyi kilitlememesi dahil), eski adların temizlenmesi, hamle kayıtları, trafik özeti, eski kayıt uyumluluğu, önbellek yarışları ve veritabanı sorgu sayısı testlerini çalıştırır. `npm run test:foods` yem kurallarını denetler. Testler geçici bellek veritabanı kullanır; canlı kayıtları değiştirmez.
+`npm run test:security` yetkilendirme, ilerleme önbelleği, okuma yollarından temizlik, dağıtım uyarıları, eksik `run_replays` tablosu, inceleme sinyalleri, sahte skor, atomik kotalar (ortak misafir kovasının kimseyi kilitlememesi dahil), eski adların temizlenmesi, hamle kayıtları, trafik özeti, eski kayıt uyumluluğu, önbellek yarışları ve veritabanı sorgu sayısı testlerini çalıştırır. `npm run test:foods` yem kurallarını denetler. Testler geçici bellek veritabanı kullanır; canlı kayıtları değiştirmez.
