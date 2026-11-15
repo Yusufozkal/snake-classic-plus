@@ -38,42 +38,32 @@ function bad(message,status=400){return json({error:message},status);}
 const preferenceKeys=/^snake_(nickname|difficulty|map|skin|cosmetic|sound_enabled|countdown_enabled|touch_sensitivity|reduce_motion|tutorial_choice_v1)$/;
 function guestIdentity(request){const cookie=request.headers.get('cookie')?.match(/(?:^|;\s*)snake_player=([^;]+)/)?.[1];return uuid.test(cookie||'')?cookie:null;}
 function dayString(time=Date.now()){return new Date(time).toISOString().slice(0,10);}
-const SHARED_NETWORK='guest-network-unavailable';
-// Returns the quota bucket for a new run. `shared` marks guests whose network address is unknown.
-async function networkRateKey(request,db,account){
-  // Cloudflare supplies this header; never trust X-Forwarded-For or the player cookie.
-  let ip=request.headers.get('cf-connecting-ip')||'';
+async function networkRateKey(request,env,db,account){
+  // Opt in only to a single-IP header overwritten by the deployment's trusted proxy.
+  const header=env.TRUSTED_IP_HEADER;
+  let ip=['cf-connecting-ip','true-client-ip','x-real-ip'].includes(header)?request.headers.get(header)||'':'';
   if(ip.includes(':')){try{const normalized=new URL('http://['+ip+']/').hostname.replace(/[\[\]]/g,''),halves=normalized.split('::'),left=halves[0]?halves[0].split(':'):[],right=halves[1]?halves[1].split(':'):[];const parts=halves.length===2?[...left,...Array(8-left.length-right.length).fill('0'),...right]:left;if(parts.length!==8)throw Error();ip=parts.slice(0,4).map(p=>p.padStart(4,'0')).join(':');}catch{ip='';}}
   else if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)||ip.split('.').some(p=>Number(p)>255))ip='';
+  else ip=ip.split('.').map(Number).join('.');
   const source=ip||account||SHARED_NETWORK;
-  return {key:await keyedHash(db,'rate_secret',source),shared:source===SHARED_NETWORK};
+  return {key:await keyedHash(await signingKey(db,'rate_secret'),source),shared:!ip&&!account};
 }
-// Guests without a network address share one bucket. Its per-minute size is a deployment
-// setting so it can follow measured traffic (see the admin traffic summary).
-function sharedStartLimit(env){const value=Number(env.SHARED_START_LIMIT_PER_MINUTE);return Number.isInteger(value)&&value>=1&&value<=100000?value:DEFAULT_SHARED_START_LIMIT;}
 // Server-side secrets are created once and stay in the database; they are never sent to clients.
-// Imported keys are kept per database binding, so listing many players costs no extra queries.
-const secretNames=new Set(['rate_secret','player_code_secret']),secretKeys=new WeakMap();
-function secretKey(db,name){
+const secretNames=new Set(['rate_secret','player_code_secret']);
+async function signingKey(db,name){
   if(!secretNames.has(name))throw new Error('Unknown secret');
-  let keys=secretKeys.get(db);if(!keys)secretKeys.set(db,keys=new Map());
-  if(!keys.has(name)){
-    const loading=(async()=>{
-      await db.prepare("INSERT OR IGNORE INTO security_state (key,value) VALUES (?,?)").bind(name,crypto.randomUUID()+crypto.randomUUID()).run();
-      const secret=await db.prepare("SELECT value FROM security_state WHERE key=?").bind(name).first();
-      return crypto.subtle.importKey('raw',new TextEncoder().encode(secret.value),{name:'HMAC',hash:'SHA-256'},false,['sign']);
-    })();
-    keys.set(name,loading);loading.catch(()=>keys.delete(name));
-  }
-  return keys.get(name);
+  await db.prepare("INSERT OR IGNORE INTO security_state (key,value) VALUES (?,?)").bind(name,crypto.randomUUID()+crypto.randomUUID()).run();
+  const secret=await db.prepare("SELECT value FROM security_state WHERE key=?").bind(name).first();
+  return crypto.subtle.importKey('raw',new TextEncoder().encode(secret.value),{name:'HMAC',hash:'SHA-256'},false,['sign']);
 }
-async function keyedHash(db,name,value){
-  return [...new Uint8Array(await crypto.subtle.sign('HMAC',await secretKey(db,name),new TextEncoder().encode(value)))].map(b=>b.toString(16).padStart(2,'0')).join('');
+async function keyedHash(key,value){
+  return [...new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(value)))].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 // Keyed, so a known account or guest identifier cannot be matched to a public code offline.
-async function playerCode(db,playerId){return (await keyedHash(db,'player_code_secret',playerId)).slice(0,16).toUpperCase();}
+async function playerCode(key,playerId){return (await keyedHash(key,playerId)).slice(0,16).toUpperCase();}
 // Invisible, direction-changing and control characters allow look-alike names. The same
 // cleaning is applied when a name is stored and when an older stored name is shown.
+// Over-long names are cut to 15 UTF-16 units without splitting a character.
 function cleanNickname(value){
   if(typeof value!=='string')return '';
   const cleaned=value.slice(0,200).normalize('NFKC').replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu,'').replace(/\s+/g,' ').trim();
@@ -81,15 +71,18 @@ function cleanNickname(value){
   return name.trim();
 }
 function shownNickname(value){return cleanNickname(value)||'Oyuncu';}
-const DEFAULT_SHARED_START_LIMIT=120,LEADERBOARD_TTL=30000,STALE_RUN_AGE=7*86400000,CLEANUP_INTERVAL=3600000;
+const SHARED_NETWORK='guest-network-unavailable',DEFAULT_SHARED_START_LIMIT=120;
 const REVIEW_MIN_SCORE=100,REVIEW_MAX_ROWS=50,REVIEW_MAX_BYTES=131072,REVIEW_RETENTION=30*86400000,COUNTER_RETENTION=30*86400000;
-let leaderboardCache=null,leaderboardGeneration=0,lastCleanup=0;
-// Drops this instance's copy. Results that are still being loaded are not stored afterwards.
-function forgetLeaderboard(){leaderboardCache=null;leaderboardGeneration++;}
+const LEADERBOARD_TTL=30000,STALE_RUN_AGE=7*86400000,CLEANUP_INTERVAL=3600000;
+const databaseStates=new WeakMap();
+function databaseState(db){let state=databaseStates.get(db);if(!state){state={cache:null,pending:null,lastCleanup:0};databaseStates.set(db,state);}return state;}
+// Guests without a network address share one bucket. Its per-minute size is a deployment
+// setting so it can follow measured traffic (see the admin traffic summary).
+function sharedStartLimit(env){const value=Number(env.SHARED_START_LIMIT_PER_MINUTE);return Number.isInteger(value)&&value>=1&&value<=100000?value:DEFAULT_SHARED_START_LIMIT;}
 // Hourly housekeeping: abandoned runs cannot be finished after three hours and go after a week;
 // stored move records and rejection counters go after thirty days.
 async function removeStaleRuns(db,now){
-  if(now-lastCleanup<CLEANUP_INTERVAL)return;lastCleanup=now;
+  const state=databaseState(db);if(now-state.lastCleanup<CLEANUP_INTERVAL)return;state.lastCleanup=now;
   try{
     await db.prepare('DELETE FROM game_runs WHERE finished_at IS NULL AND started_at<?').bind(now-STALE_RUN_AGE).run();
     await db.prepare('DELETE FROM run_replays WHERE stored_at<?').bind(now-REVIEW_RETENTION).run();
@@ -97,6 +90,7 @@ async function removeStaleRuns(db,now){
   }catch(error){console.error('Housekeeping failed',error?.message);}
 }
 // Keeps the moves of only the highest verified scores so the owner can review suspected bots.
+// A failure here must never make the score save fail.
 async function storeReview(db,id,score,input,now){
   if(score<REVIEW_MIN_SCORE)return;
   try{
@@ -132,21 +126,30 @@ async function start(request,env) {
   const input=await body(request);
   if(Object.hasOwn(input,'accountKey')&&input.accountKey!==await accountId(request))return bad('Açık hesap değişti. Sayfayı yenile.',409);
   const nickname=typeof input.nickname==='string'&&input.nickname.length<=200?cleanNickname(input.nickname):'';
-  if(input.skin!==undefined&&!['blue','green','red','purple','gold','rainbow'].includes(input.skin)||input.cosmetic!==undefined&&!['none','crown','sunglasses','tophat','cap','bow'].includes(input.cosmetic))return bad('Görünüm seçimi geçersiz.');
-  if(!nickname||!maps.has(input.map)||!difficulties.has(input.difficulty)||!uuid.test(input.id||'')||!uuid.test(input.token||''))return bad('Oyuncu adı veya oyun ayarları geçersiz.');
+  if(!maps.has(input.map)||!difficulties.has(input.difficulty)||!uuid.test(input.id||'')||!uuid.test(input.token||''))return bad('Oyuncu adı veya oyun ayarları geçersiz.');
   const db=database(env),now=Date.now(),tokenHash=await hash(input.token);
   await removeStaleRuns(db,now);
   const account=await accountId(request),guestId=guestIdentity(request)||crypto.randomUUID(),playerId=account||guestId;
   const responseFor=run=>json({id:input.id,seed:run.seed,rulesVersion:run.rules_version,maxTicks:MAX_REPLAY_TICKS},201,{'Set-Cookie':`snake_player=${run.player_id.startsWith('account:')?guestId:run.player_id}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=31536000`});
   const existing=await db.prepare('SELECT * FROM game_runs WHERE id=?').bind(input.id).first();
   if(existing){if(existing.token_hash!==tokenHash||existing.map!==input.map||existing.difficulty!==input.difficulty||(existing.player_id.startsWith('account:')?existing.player_id!==account:!!account))return bad('Oyun kimliği kullanımda.',409);if(![1,2,RULES_VERSION].includes(existing.rules_version))return bad('Eski oyun kaydı. Yeni bir oyun başlat.',409);return responseFor(existing);}
+  // Existing token-bound runs remain retryable even if newer name rules reject their name.
+  if(!nickname)return bad('Oyuncu adı veya oyun ayarları geçersiz.');
+  if(input.skin!==undefined&&!['blue','green','red','purple','gold','rainbow'].includes(input.skin)||input.cosmetic!==undefined&&!['none','crown','sunglasses','tophat','cap','bow'].includes(input.cosmetic))return bad('Görünüm seçimi geçersiz.');
   if(input.rulesVersion!==RULES_VERSION)return bad('Oyun güncellendi. Sayfayı yenileyip yeni bir oyun başlat.',409);
-  const rate=await networkRateKey(request,db,account),rateKey=rate.key,seed=crypto.getRandomValues(new Uint32Array(1))[0],cosmetic=input.skin&&input.skin!=='blue'||input.cosmetic&&input.cosmetic!=='none'?'styled':'plain';
-  const result=await db.prepare('INSERT OR IGNORE INTO game_runs (id,player_id,token_hash,nickname,map,difficulty,started_at,seed,rules_version,rate_key,cosmetic,quest_date) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<? AND (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<12 AND (? OR (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<300)').bind(input.id,playerId,tokenHash,nickname,input.map,input.difficulty,now,seed,RULES_VERSION,rateKey,cosmetic,dayString(now),rateKey,now-60000,rate.shared?sharedStartLimit(env):12,playerId,now-60000,rate.shared?1:0,rateKey,now-86400000).run();
+  const network=await networkRateKey(request,env,db,account),seed=crypto.getRandomValues(new Uint32Array(1))[0],cosmetic=input.skin&&input.skin!=='blue'||input.cosmetic&&input.cosmetic!=='none'?'styled':'plain';
+  // All quotas are checked inside the insert, so concurrent requests cannot overbook. Nothing counts
+  // all runs of the site: the shared guest bucket has a per-minute size only, and no daily cap.
+  await db.prepare(`INSERT OR IGNORE INTO game_runs (id,player_id,token_hash,nickname,map,difficulty,started_at,seed,rules_version,rate_key,cosmetic,quest_date)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE
+    (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<? AND
+    (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<12 AND
+    (SELECT COUNT(*) FROM game_runs WHERE player_id=? AND started_at>?)<300 AND
+    (? OR (SELECT COUNT(*) FROM game_runs WHERE rate_key=? AND started_at>?)<300)`).bind(input.id,playerId,tokenHash,nickname,input.map,input.difficulty,now,seed,RULES_VERSION,network.key,cosmetic,dayString(now),network.key,now-60000,network.shared?sharedStartLimit(env):12,playerId,now-60000,playerId,now-86400000,network.shared?1:0,network.key,now-86400000).run();
   const stored=await db.prepare('SELECT * FROM game_runs WHERE id=?').bind(input.id).first();
   if(!stored){
     // Counted per day so the shared limit can be tuned from real traffic.
-    try{await db.prepare("INSERT INTO security_state (key,value) VALUES (?,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").bind('start_rejected:'+dayString(now)+(rate.shared?':shared':':network')).run();}catch(error){console.error('Rejection not counted',error?.message);}
+    try{await db.prepare("INSERT INTO security_state (key,value) VALUES (?,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").bind('start_rejected:'+dayString(now)+(network.shared?':shared':':network')).run();}catch(error){console.error('Rejection not counted',error?.message);}
     return bad('Yeni oyun sınırına ulaşıldı. Biraz sonra tekrar dene veya antrenman modunu kullan.',429);
   }
   if(stored.token_hash!==tokenHash)return bad('Oyun kimliği kullanımda.',409);
@@ -170,7 +173,8 @@ async function finish(request,env,id) {
   const rewards={...replay.rewards,achievements:Object.fromEntries(replay.rewards.achievements.map(k=>[k,1]))};if(run.cosmetic==='styled')rewards.achievements.fashion_icon=1;
   const update=await db.prepare('UPDATE game_runs SET finished_at=?,score=?,duration_seconds=?,outcome=?,verified=1,proof_hash=?,rewards=? WHERE id=? AND finished_at IS NULL').bind(now,replay.score,Math.floor(replay.elapsed/1000),input.outcome,proofHash,JSON.stringify(rewards),id).run();
   const saved=await db.prepare('SELECT proof_hash,score FROM game_runs WHERE id=?').bind(id).first();if(saved.proof_hash!==proofHash)return bad('Bu oyun zaten kaydedildi.',409);
-  forgetLeaderboard();
+  databaseState(db).cache=null;
+  // Only the request that stored the result keeps its moves.
   if(Number(update.meta?.changes??update.changes))await storeReview(db,id,replay.score,input,now);
   return json({saved:true,score:saved.score,progress:await readProgress(env,run.player_id)});
 }
@@ -184,20 +188,18 @@ async function admin(request,env,url){
   if(search){where.push("nickname LIKE ? ESCAPE '\\'");values.push('%'+search.replace(/[\\%_]/g,'\\$&')+'%');}
   if(map){where.push('map = ?');values.push(map);}
   const clause=where.length?' WHERE '+where.join(' AND '):'';
-  const db=database(env),now=Date.now(),day=now-86400000,sharedKey=await keyedHash(db,'rate_secret',SHARED_NETWORK);
-  const [summary,count,rows,starts,peak,sharedPeak,rejected]=await Promise.all([
+  const db=database(env),now=Date.now(),day=now-86400000,sharedKey=await keyedHash(await signingKey(db,'rate_secret'),SHARED_NETWORK);
+  const [summary,count,rows,starts]=await Promise.all([
     db.prepare("SELECT COUNT(*) AS total_games, COUNT(DISTINCT player_id) AS players, COUNT(finished_at) AS finished_games, COALESCE(MAX(CASE WHEN verified=1 THEN score END),0) AS best_score FROM game_runs").first(),
     db.prepare('SELECT COUNT(*) AS count FROM game_runs'+clause).bind(...values).first(),
     db.prepare('SELECT id, player_id, nickname, map, difficulty, started_at, finished_at, score, duration_seconds, outcome, verified, EXISTS(SELECT 1 FROM run_replays WHERE run_id=game_runs.id) AS has_replay FROM game_runs'+clause+' ORDER BY started_at DESC, id DESC LIMIT 50 OFFSET ?').bind(...values,(page-1)*50).all(),
-    db.prepare('SELECT COUNT(*) AS total, COALESCE(SUM(rate_key=?),0) AS shared FROM game_runs WHERE started_at>?').bind(sharedKey,day).first(),
-    db.prepare('SELECT COALESCE(MAX(n),0) AS n FROM (SELECT COUNT(*) AS n FROM game_runs WHERE started_at>? GROUP BY started_at/60000)').bind(day).first(),
-    db.prepare('SELECT COALESCE(MAX(n),0) AS n FROM (SELECT COUNT(*) AS n FROM game_runs WHERE started_at>? AND rate_key=? GROUP BY started_at/60000)').bind(day,sharedKey).first(),
-    db.prepare("SELECT key,value FROM security_state WHERE key IN (?,?)").bind('start_rejected:'+dayString(now)+':shared','start_rejected:'+dayString(now)+':network').all(),
+    // One query for the whole traffic summary keeps the page's query count constant.
+    db.prepare("SELECT (SELECT COUNT(*) FROM game_runs WHERE started_at>?1) AS total, (SELECT COUNT(*) FROM game_runs WHERE started_at>?1 AND rate_key=?2) AS shared, (SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM game_runs WHERE started_at>?1 GROUP BY started_at/60000)) AS peak, (SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) AS n FROM game_runs WHERE started_at>?1 AND rate_key=?2 GROUP BY started_at/60000)) AS shared_peak, (SELECT value FROM security_state WHERE key=?3) AS rejected_shared, (SELECT value FROM security_state WHERE key=?4) AS rejected_network").bind(day,sharedKey,'start_rejected:'+dayString(now)+':shared','start_rejected:'+dayString(now)+':network').first(),
   ]);
-  const rejectedToday=kind=>Number(rejected.results.find(r=>r.key.endsWith(':'+kind))?.value||0);
   // Starts in the last 24 hours; "shared" means guests whose network address was not available.
-  const traffic={starts24h:starts.total,sharedStarts24h:Number(starts.shared),peakPerMinute:peak.n,sharedPeakPerMinute:sharedPeak.n,sharedLimitPerMinute:sharedStartLimit(env),rejectedToday:{shared:rejectedToday('shared'),network:rejectedToday('network')}};
-  const runs=await Promise.all(rows.results.map(async ({player_id,nickname,has_replay,...run})=>({...run,nickname:shownNickname(nickname),has_replay:!!has_replay,player_code:await playerCode(db,player_id)})));
+  const traffic={starts24h:starts.total,sharedStarts24h:Number(starts.shared),peakPerMinute:starts.peak,sharedPeakPerMinute:starts.shared_peak,sharedLimitPerMinute:sharedStartLimit(env),rejectedToday:{shared:Number(starts.rejected_shared||0),network:Number(starts.rejected_network||0)}};
+  const codeKey=rows.results.length?await signingKey(db,'player_code_secret'):null;
+  const runs=await Promise.all(rows.results.map(async ({player_id,nickname,has_replay,...run})=>({...run,nickname:shownNickname(nickname),has_replay:!!has_replay,player_code:await playerCode(codeKey,player_id)})));
   return json({summary,total:count.count,page,pageSize:50,runs,traffic});
 }
 async function replayRecord(request,env,id){
@@ -234,17 +236,23 @@ async function saveProfile(request,env){
   if(!Number(result.meta?.changes??result.changes))return bad('Kayıt başka bir cihazda değişti. Sayfayı yenileyerek güncel kaydı yükle.',409);
   return json({revision:input.revision+1});
 }
-async function leaderboardEpoch(db){return (await db.prepare("SELECT value FROM security_state WHERE key='leaderboard_epoch'").first())?.value||'';}
 async function leaderboard(env){
-  // The ranking scans every verified run, so one result is shared for a short time. A deletion
-  // changes the stored epoch, which every instance checks with one key lookup before reusing its copy.
-  const db=database(env),now=Date.now(),epoch=await leaderboardEpoch(db),cached=leaderboardCache;
-  if(cached&&cached.db===db&&cached.epoch===epoch&&now>=cached.time&&now-cached.time<LEADERBOARD_TTL)return json({scores:cached.scores});
-  const generation=leaderboardGeneration,rows=await db.prepare('SELECT player_id, nickname, score, map, difficulty, finished_at FROM (SELECT id, player_id, nickname, score, map, difficulty, finished_at, ROW_NUMBER() OVER (PARTITION BY player_id, map, difficulty ORDER BY score DESC, finished_at ASC, id ASC) AS position FROM game_runs WHERE verified=1 AND finished_at IS NOT NULL AND score > 0) WHERE position = 1 ORDER BY score DESC, finished_at ASC, id ASC LIMIT 20').all();
-  const scores=await Promise.all(rows.results.map(async r=>({name:shownNickname(r.nickname),score:r.score,map:r.map,diff:r.difficulty,date:new Date(r.finished_at).toLocaleDateString('tr-TR'),playerCode:await playerCode(db,r.player_id)})));
-  // Skip storing when a score was saved or deleted while this result was being loaded.
-  if(generation===leaderboardGeneration&&epoch===await leaderboardEpoch(db))leaderboardCache={db,time:now,epoch,scores};
-  return json({scores});
+  const db=database(env),state=databaseState(db),now=Date.now();
+  // Database triggers invalidate caches in every Worker instance, including in-flight reads.
+  const revision=(await db.prepare("SELECT value FROM security_state WHERE key='leaderboard_revision'").first())?.value??'0';
+  if(revision!==undefined&&state.cache?.revision===revision&&now>=state.cache.time&&now-state.cache.time<LEADERBOARD_TTL)return json({scores:state.cache.scores});
+  if(revision!==undefined&&state.pending?.revision===revision)return json({scores:await state.pending.promise});
+  const pending={revision};
+  pending.promise=(async()=>{
+    const rows=await db.prepare('SELECT player_id, nickname, score, map, difficulty, finished_at FROM (SELECT id, player_id, nickname, score, map, difficulty, finished_at, ROW_NUMBER() OVER (PARTITION BY player_id, map, difficulty ORDER BY score DESC, finished_at ASC, id ASC) AS position FROM game_runs WHERE verified=1 AND finished_at IS NOT NULL AND score > 0) WHERE position = 1 ORDER BY score DESC, finished_at ASC, id ASC LIMIT 20').all();
+    const codeKey=rows.results.length?await signingKey(db,'player_code_secret'):null;
+    const scores=await Promise.all(rows.results.map(async r=>({name:shownNickname(r.nickname),score:r.score,map:r.map,diff:r.difficulty,date:new Date(r.finished_at).toLocaleDateString('tr-TR'),playerCode:await playerCode(codeKey,r.player_id)})));
+    const after=(await db.prepare("SELECT value FROM security_state WHERE key='leaderboard_revision'").first())?.value??'0';
+    if(revision!==undefined&&after===revision)state.cache={time:now,revision,scores};
+    return scores;
+  })();
+  state.pending=pending;
+  try{return json({scores:await pending.promise});}finally{if(state.pending===pending)state.pending=null;}
 }
 async function deleteRuns(request,env){
   if(!owner(request,env))return bad('Bu işlem yalnızca site sahibine açıktır.',request.headers.get('oai-authenticated-user-id')?403:401);
@@ -252,11 +260,9 @@ async function deleteRuns(request,env){
   if(!Array.isArray(input.ids)||input.ids.length<1||input.ids.length>50||input.ids.some(id=>typeof id!=='string'||!uuid.test(id)))return bad('1 ile 50 arasında geçerli kayıt seçmelisin.');
   const ids=[...new Set(input.ids)];
   const db=database(env),marks=ids.map(()=>'?').join(',');
-  const result=await db.prepare('DELETE FROM game_runs WHERE id IN ('+marks+')').bind(...ids).run();
   await db.prepare('DELETE FROM run_replays WHERE run_id IN ('+marks+')').bind(...ids).run();
-  // Other instances notice the new epoch and stop serving the deleted score from their copy.
-  await db.prepare("INSERT INTO security_state (key,value) VALUES ('leaderboard_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(crypto.randomUUID()).run();
-  forgetLeaderboard();
+  const result=await db.prepare('DELETE FROM game_runs WHERE id IN ('+marks+')').bind(...ids).run();
+  databaseState(db).cache=null;
   return json({deleted:Number(result.meta?.changes??result.changes??0)});
 }
 async function securityReport(request,env){
@@ -314,15 +320,15 @@ const app = {
  }
 };
 export default {async fetch(request,env){
+  // Raw HTTP callers and copies of this Worker have no platform identity by default.
+  if(env.TRUST_PLATFORM_IDENTITY!=='1'){
+    const headers=new Headers(request.headers);
+    for(const key of [...headers.keys()])if(key.startsWith('oai-authenticated-'))headers.delete(key);
+    request=new Request(request,{headers});
+  }
   const url=new URL(request.url);
   if(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)){
     url.protocol='https:';return secureResponse(new Response(null,{status:308,headers:{Location:url.href}}),request);
-  }
-  // Identity headers count only where the deployment states that its platform sets them and
-  // removes any copy sent by a visitor. This switch does not authenticate anyone by itself.
-  if(env?.TRUST_PLATFORM_IDENTITY!=='1'&&[...request.headers.keys()].some(name=>name.startsWith('oai-authenticated-'))){
-    const headers=new Headers(request.headers);for(const name of [...headers.keys()])if(name.startsWith('oai-authenticated-'))headers.delete(name);
-    request=new Request(request,{headers});
   }
   const routed=request.method==='HEAD'?new Request(request,{method:'GET'}):request;
   return secureResponse(await app.fetch(routed,env),request);

@@ -4,7 +4,7 @@ const {pathToFileURL}=require('node:url'),{DatabaseSync}=require('node:sqlite');
  const worker=(await import(pathToFileURL(path.resolve('dist/server/index.js')))).default;
  const db=new DatabaseSync(':memory:');
  for(const f of fs.readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())db.exec(fs.readFileSync('drizzle/'+f,'utf8'));
- const env={ADMIN_EMAIL:'owner@example.com',TRUST_PLATFORM_IDENTITY:'1',DB:{prepare(sql){const statement=db.prepare(sql);let values=[];return{bind(...v){values=v;return this},async first(){return statement.get(...values)||null},async all(){return{results:statement.all(...values)}},async run(){return statement.run(...values)}}}}};
+ const env={TRUST_PLATFORM_IDENTITY:'1',TRUSTED_IP_HEADER:'cf-connecting-ip',ADMIN_EMAIL:'owner@example.com',DB:{prepare(sql){const statement=db.prepare(sql);let values=[];return{bind(...v){values=v;return this},async first(){return statement.get(...values)||null},async all(){return{results:statement.all(...values)}},async run(){return statement.run(...values)}}}}};
  const owner={'oai-authenticated-user-id':'owner','oai-authenticated-user-email':'owner@example.com'},reporter={'oai-authenticated-user-id':'researcher'};
  const call=(route,method='GET',data,headers={})=>worker.fetch(new Request('https://game.example'+route,{method,headers:{...(data?{Origin:'https://game.example','Content-Type':'application/json'}:{}),...headers},body:data?JSON.stringify(data):undefined}),env);
  try{
@@ -44,8 +44,8 @@ const {pathToFileURL}=require('node:url'),{DatabaseSync}=require('node:sqlite');
   assert.match(listed.player_code,/^[0-9A-F]{16}$/);assert.notEqual(listed.player_code,require('node:crypto').createHash('sha256').update('snake-player-code:'+stored).digest('hex').slice(0,16).toUpperCase());assert(!('player_id' in listed));
   // The leaderboard is served from a short-lived cache; admin deletion clears it.
   db.prepare("UPDATE game_runs SET finished_at=started_at+1,score=50,verified=1,outcome='completed' WHERE id=?").run(run.id);
-  const realNow=Date.now,board=async()=>(await (await call('/api/leaderboard')).json()).scores;assert.equal((await board()).length,0,'earlier empty result is still cached');Date.now=()=>realNow()+60000;assert.equal((await board()).length,1);assert.equal((await board())[0].playerCode,listed.player_code);
-  db.prepare('UPDATE game_runs SET score=60 WHERE id=?').run(run.id);assert.equal((await board())[0].score,50);
+  const realNow=Date.now,board=async()=>(await (await call('/api/leaderboard')).json()).scores;assert.equal((await board()).length,1,'verified updates invalidate every cached result');assert.equal((await board())[0].playerCode,listed.player_code);
+  db.prepare('UPDATE game_runs SET score=60 WHERE id=?').run(run.id);assert.equal((await board())[0].score,60);
   assert.equal((await call('/api/admin/runs/delete','POST',{ids:[run.id]},owner)).status,200);assert.equal((await board()).length,0);
   // Abandoned runs older than a week are removed; finished and recent rows stay.
   const old=Date.now()-8*86400000,insert=db.prepare('INSERT INTO game_runs(id,player_id,token_hash,nickname,map,difficulty,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?)');
@@ -53,38 +53,28 @@ const {pathToFileURL}=require('node:url'),{DatabaseSync}=require('node:sqlite');
   Date.now=()=>realNow()+2*3600000;
   try{assert.equal((await call('/api/runs','POST',{...run,id:crypto.randomUUID(),nickname:'Fresh'},{'cf-connecting-ip':'198.51.100.8'})).status,201);}finally{Date.now=realNow;}
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM game_runs WHERE id='stale'").get().n,0);assert.equal(db.prepare("SELECT COUNT(*) AS n FROM game_runs WHERE id='kept'").get().n,1);
-  // Listing fifty players must not load the code secret once per row.
+  // Names stored before the cleaning rule are cleaned when shown; names that become empty are shown as Oyuncu.
   const seedRow=db.prepare("INSERT INTO game_runs(id,player_id,token_hash,nickname,map,difficulty,started_at,finished_at,score,outcome,verified,rate_key) VALUES(?,?,?,?,?,?,?,?,?,?,1,'x')");
-  for(let i=0;i<60;i++)seedRow.run(crypto.randomUUID(),crypto.randomUUID(),'t','Player '+i,'classic','easy',realNow()-i,realNow()-i+1,10+i,'completed');
-  let queries=0;const prepare=env.DB.prepare;env.DB.prepare=sql=>{queries++;return prepare(sql);};
-  const listing=await (await call('/api/admin/runs','GET',undefined,owner)).json();assert.equal(listing.runs.length,50);assert(queries<=8,'admin list used '+queries+' queries');
-  Date.now=()=>realNow()+3*60000;queries=0;assert.equal((await board()).length,20);assert(queries<=3,'leaderboard used '+queries+' queries');queries=0;await board();assert.equal(queries,1,'cached leaderboard only checks the epoch');env.DB.prepare=prepare;
-  // A second worker instance with its own cache must drop a deleted score at once.
-  const other=(await import(pathToFileURL(path.resolve('dist/server/index.js')).href+'?second-instance')).default,otherBoard=async()=>(await (await other.fetch(new Request('https://game.example/api/leaderboard'),env)).json()).scores;
-  const top=db.prepare('SELECT id,score FROM game_runs WHERE verified=1 ORDER BY score DESC LIMIT 1').get();assert.equal((await otherBoard())[0].score,top.score);assert.equal((await board())[0].score,top.score);
-  assert.equal((await call('/api/admin/runs/delete','POST',{ids:[top.id]},owner)).status,200);assert.notEqual((await otherBoard())[0].score,top.score,'deleted score left the other instance');assert.notEqual((await board())[0].score,top.score);
-  // Names stored before the cleaning rule are cleaned when shown.
-  seedRow.run('old-name','old-player','t','‮Eski​ Ad','classic','easy',realNow(),realNow()+1,9000,'completed');seedRow.run('blank-name','blank-player','t','​⁦','classic','easy',realNow(),realNow()+1,8999,'completed');
-  Date.now=()=>realNow()+6*60000;const named=await board();assert.equal(named[0].name,'Eski Ad');assert.equal(named[1].name,'Oyuncu');
+  seedRow.run('old-name','old-player','t','‮Eski​ Ad','classic','easy',realNow(),realNow()+1,9000,'completed');seedRow.run('blank-name','blank-player','t','​⁦','classic','easy',realNow(),realNow()+1,8999,'completed');seedRow.run('long-name','long-player','t','Çok Uzun Bir Oyuncu Adı','classic','easy',realNow(),realNow()+1,8998,'completed');
+  const named=await board();assert.equal(named[0].name,'Eski Ad');assert.equal(named[1].name,'Oyuncu');assert.equal(named[2].name,'Çok Uzun Bir Oy');
   const adminNames=(await (await call('/api/admin/runs?q=Eski','GET',undefined,owner)).json()).runs;assert.equal(adminNames[0].nickname,'Eski Ad');
   const accountKey='account:'+require('node:crypto').createHash('sha256').update('researcher').digest('hex');db.prepare('INSERT INTO player_profiles(account_id,data,revision) VALUES(?,?,1)').run(accountKey,JSON.stringify({snake_nickname:'‮Saklı​ Ad Uzun Bir İsim'}));
   assert.equal((await (await call('/api/profile','GET',undefined,reporter)).json()).data.snake_nickname,'Saklı Ad Uzun B');
   assert.equal((await call('/api/profile','POST',{accountKey,revision:1,data:{snake_nickname:'Ye​ni‮'}},reporter)).status,200);assert.equal(JSON.parse(db.prepare('SELECT data FROM player_profiles WHERE account_id=?').get(accountKey).data).snake_nickname,'Yeni');
-  db.prepare("DELETE FROM game_runs WHERE id IN ('old-name','blank-name')").run();
-  // Identity headers are ignored unless the deployment opts in.
-  for(const untrusted of [{...env,TRUST_PLATFORM_IDENTITY:undefined},{...env,TRUST_PLATFORM_IDENTITY:'true'}]){
-   const ask=(route,method='GET',data)=>worker.fetch(new Request('https://game.example'+route,{method,headers:{...owner,...(data?{Origin:'https://game.example','Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined}),untrusted);
-   assert.equal((await ask('/api/admin/runs')).status,401);assert.equal((await ask('/api/profile')).status,401);assert.equal((await ask('/api/admin/security-reports')).status,401);assert.equal((await ask('/api/admin/runs/delete','POST',{ids:[crypto.randomUUID()]})).status,401);
-  }
-  // Guests without a network address share a configurable per-minute bucket with no daily cap.
-  const limited={...env,SHARED_START_LIMIT_PER_MINUTE:'3'},guestStart=()=>worker.fetch(new Request('https://game.example/api/runs',{method:'POST',headers:{Origin:'https://game.example','Content-Type':'application/json'},body:JSON.stringify({...run,id:crypto.randomUUID(),nickname:'Guest'})}),limited);
-  Date.now=()=>realNow()+3*3600000;
-  for(let i=0;i<3;i++)assert.equal((await guestStart()).status,201);assert.equal((await guestStart()).status,429);
-  const sharedKey=db.prepare("SELECT rate_key FROM game_runs WHERE nickname='Guest' LIMIT 1").get().rate_key,bulk=db.prepare("INSERT INTO game_runs(id,player_id,token_hash,nickname,map,difficulty,started_at,rate_key) VALUES(?,?,'t','Bulk','classic','easy',?,?)");
-  for(let i=0;i<400;i++)bulk.run(crypto.randomUUID(),crypto.randomUUID(),realNow()+2*3600000,sharedKey);
-  Date.now=()=>realNow()+3*3600000+120000;assert.equal((await guestStart()).status,201,'no daily cap on the shared bucket');
+  const longStart={...run,id:crypto.randomUUID(),nickname:'Çok Uzun Bir Oyuncu Adı'};assert.equal((await call('/api/runs','POST',longStart,{'cf-connecting-ip':'198.51.100.10'})).status,201);assert.equal(db.prepare('SELECT nickname FROM game_runs WHERE id=?').get(longStart.id).nickname,'Çok Uzun Bir Oy');
+  db.prepare("DELETE FROM game_runs WHERE id IN ('old-name','blank-name','long-name')").run();
+  // Guests without a network address share a configurable per-minute bucket with no daily cap; it never blocks others.
+  const base=Date.parse('2031-03-05T12:00:00Z'),limited={...env,SHARED_START_LIMIT_PER_MINUTE:'3'};
+  const startAs=(headers={})=>worker.fetch(new Request('https://game.example/api/runs',{method:'POST',headers:{Origin:'https://game.example','Content-Type':'application/json',...headers},body:JSON.stringify({...run,id:crypto.randomUUID(),nickname:'Guest'})}),limited);
+  Date.now=()=>base;
+  for(let i=0;i<3;i++)assert.equal((await startAs()).status,201);assert.equal((await startAs()).status,429);
+  assert.equal((await startAs({'oai-authenticated-user-id':'signed-in'})).status,201,'signed-in players are not locked out by guests');
+  assert.equal((await startAs({'cf-connecting-ip':'203.0.113.5'})).status,201,'guests with a network address are not locked out');
+  const sharedKey=db.prepare("SELECT rate_key FROM game_runs WHERE nickname='Guest' ORDER BY started_at LIMIT 1").get().rate_key,bulk=db.prepare("INSERT INTO game_runs(id,player_id,token_hash,nickname,map,difficulty,started_at,rate_key) VALUES(?,?,'t','Bulk','classic','easy',?,?)");
+  for(let i=0;i<400;i++)bulk.run(crypto.randomUUID(),crypto.randomUUID(),base-3600000,sharedKey);
+  Date.now=()=>base+120000;assert.equal((await startAs()).status,201,'no daily cap on the shared bucket');
   const traffic=(await (await worker.fetch(new Request('https://game.example/api/admin/runs',{headers:owner}),limited)).json()).traffic;
-  assert.equal(traffic.sharedLimitPerMinute,3);assert.equal(traffic.rejectedToday.shared,1);assert(traffic.sharedStarts24h>=404);assert.equal(traffic.sharedPeakPerMinute,400);assert(traffic.starts24h>=traffic.sharedStarts24h);
+  assert.equal(traffic.sharedLimitPerMinute,3);assert.deepEqual(traffic.rejectedToday,{shared:1,network:0});assert.equal(traffic.starts24h,406);assert.equal(traffic.sharedStarts24h,404);assert.equal(traffic.peakPerMinute,400);assert.equal(traffic.sharedPeakPerMinute,400);
   assert.equal((await (await call('/api/admin/runs','GET',undefined,owner)).json()).traffic.sharedLimitPerMinute,120);
   db.prepare("DELETE FROM game_runs WHERE nickname='Bulk'").run();
   // Only high verified scores keep their moves, and only the owner can read them.
@@ -108,24 +98,26 @@ const {pathToFileURL}=require('node:url'),{DatabaseSync}=require('node:sqlite');
    }
    throw new Error('No simulated game reached '+target+' points');
   }
-  Date.now=()=>realNow()+4*3600000;
+  Date.now=()=>base+4*3600000;
   const low=await play(20);assert.equal(low.response.status,200);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays').get().n,0,'ordinary scores are not recorded');
-  Date.now=()=>realNow()+5*3600000;
+  Date.now=()=>base+5*3600000;
   const high=await play(100);assert.equal(high.response.status,200);
   const record=db.prepare('SELECT * FROM run_replays WHERE run_id=?').get(high.game.id);assert.equal(record.score,high.state.score);assert.deepEqual(JSON.parse(record.moves),high.moves);assert(record.bytes<=131072);
   const replayRoute='/api/admin/runs/'+high.game.id+'/replay';assert.equal((await call(replayRoute)).status,401);assert.equal((await call(replayRoute,'GET',undefined,reporter)).status,403);
   const review=await (await call(replayRoute,'GET',undefined,owner)).json();assert.deepEqual(review.moves,high.moves);assert.equal(review.ticks,high.state.ticks);assert.equal(typeof review.seed,'number');assert(!('player_id' in review));
   assert.equal((await (await call('/api/admin/runs?q=Reviewer','GET',undefined,owner)).json()).runs.find(r=>r.id===high.game.id).has_replay,true);
+  // Repeating the finish request does not store the moves again.
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays WHERE run_id=?').get(high.game.id).n,1);
   // At most fifty records are kept, the lowest score goes first, and oversized move lists are not stored.
   const fill=db.prepare('INSERT INTO run_replays(run_id,score,ticks,moves,bytes,stored_at) VALUES(?,?,?,?,?,?)');for(let i=0;i<49;i++)fill.run('filler-'+i,100000+i,1,'[]',2,Date.now());
-  Date.now=()=>realNow()+6*3600000;const next=await play(high.state.score+10);assert.equal(next.response.status,200);
+  Date.now=()=>base+6*3600000;const next=await play(high.state.score+10);assert.equal(next.response.status,200);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays').get().n,50);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays WHERE run_id=?').get(high.game.id).n,0);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays WHERE run_id=?').get(next.game.id).n,1);
   assert.equal((await call('/api/admin/runs/delete','POST',{ids:[next.game.id]},owner)).status,200);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays WHERE run_id=?').get(next.game.id).n,0,'deleting a run deletes its moves');
-  // Records older than thirty days are removed by the hourly housekeeping.
-  Date.now=()=>realNow()+31*86400000;assert.equal((await call('/api/runs','POST',{...run,id:crypto.randomUUID(),nickname:'Later'},{'cf-connecting-ip':'198.51.100.9'})).status,201);
+  // Records and rejection counters older than thirty days are removed by the hourly housekeeping.
+  Date.now=()=>base+31*86400000;assert.equal((await call('/api/runs','POST',{...run,id:crypto.randomUUID(),nickname:'Later'},{'cf-connecting-ip':'198.51.100.9'})).status,201);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM run_replays').get().n,0);assert.equal(db.prepare("SELECT COUNT(*) AS n FROM security_state WHERE key LIKE 'start_rejected:%'").get().n,0);
   Date.now=realNow;
   const broken=await worker.fetch(new Request('https://game.example/api/profile',{headers:owner}),{TRUST_PLATFORM_IDENTITY:'1'});assert.equal(broken.status,503);assert(broken.headers.has('content-security-policy'));assert(!JSON.stringify(await broken.json()).includes('Database'));
-  console.log('PASS: security headers on HTML/JSON/errors/assets/HEAD, nonce rotation, HTTPS redirect, security.txt, private report delivery, authorization, rate limits, admin framing, nickname cleaning, keyed player codes, leaderboard cache across instances, query counts, stored-name cleaning, identity opt-in, shared start limit and traffic summary, bounded move records and housekeeping.');
+  console.log('PASS: security headers on HTML/JSON/errors/assets/HEAD, nonce rotation, HTTPS redirect, security.txt, private report delivery, authorization, rate limits, admin framing, nickname cleaning (new and stored names), keyed player codes, leaderboard cache, stale-run cleanup, shared guest bucket and traffic summary, bounded move records and housekeeping.');
  }finally{db.close();}
 })().catch(error=>{console.error(error);process.exit(1);});

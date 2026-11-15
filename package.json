@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "node build-worker.cjs && node serve-worker.cjs",
     "build": "node build-worker.cjs",
-    "test:security": "node build-worker.cjs && node tests/security.cjs && node tests/game-integrity.cjs",
+    "test:security": "node build-worker.cjs && node tests/security.cjs && node tests/game-integrity.cjs && node tests/hardening.cjs",
     "test:foods": "node build-worker.cjs && node tests/food-consistency.cjs",
     "start": "node serve-worker.cjs",
     "lint": "oxlint",
