@@ -40,3 +40,12 @@ export const runs = sqliteTable('game_runs', {
   index('idx_runs_verified_player').on(table.playerId, table.verified, table.questDate),
 ]);
 export const securityState = sqliteTable('security_state', {key:text('key').primaryKey(),value:text('value').notNull()});
+// Move records of the highest verified scores, kept briefly for manual bot review.
+export const runReplays = sqliteTable('run_replays', {
+  runId: text('run_id').primaryKey(),
+  score: integer('score').notNull(),
+  ticks: integer('ticks').notNull(),
+  moves: text('moves'),
+  bytes: integer('bytes').notNull(),
+  storedAt: integer('stored_at').notNull(),
+}, table => [index('idx_replays_score').on(table.score), index('idx_replays_stored').on(table.storedAt)]);

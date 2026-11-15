@@ -1,9 +1,8 @@
 nodeLinker: hoisted
 ignoredBuiltDependencies:
   - esbuild
-  - sharp
-  - workerd
-allowBuilds:
-  esbuild: set this to true or false
-  sharp: set this to true or false
-  workerd: set this to true or false
+overrides:
+  # oxfmt pins a tinypool release with known prototype-pollution advisories.
+  tinypool: ^2.1.2
+  # drizzle-kit's legacy esbuild-kit loader pins esbuild 0.18, which has an advisory (GHSA-67mh-4wv8-2f99).
+  '@esbuild-kit/core-utils>esbuild': ^0.25.12
